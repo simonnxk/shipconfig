@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 type Preset = "node" | "python" | "go" | "static";
+type ResolveTarget = "docker" | "kubernetes";
 
 type ResolveRequest = {
   query?: unknown;
@@ -19,6 +20,11 @@ type ResolveSuggestion = {
   confidence: number;
   description: string;
   preset?: Preset;
+  namespace?: string;
+  replicas?: number;
+  cpu?: string;
+  memory?: string;
+  ingressHost?: string;
 };
 
 type DockerHubRepository = {
@@ -162,6 +168,75 @@ const knownHealthPaths: Record<string, string> = {
   ollama: "/api/tags",
 };
 
+const statefulWorkloads = new Set(["postgres", "postgresql", "redis", "ollama"]);
+
+const kubernetesProfiles: Record<string, Partial<ResolveSuggestion>> = {
+  litellm: {
+    namespace: "production",
+    replicas: 3,
+    cpu: "500m",
+    memory: "1Gi",
+    source: "curated Kubernetes workload profile",
+    description: "LiteLLM proxy workload with production namespace, three replicas, HTTP readiness, and placeholder secrets.",
+  },
+  "berriai/litellm": {
+    namespace: "production",
+    replicas: 3,
+    cpu: "500m",
+    memory: "1Gi",
+    source: "curated Kubernetes workload profile",
+    description: "LiteLLM proxy workload with production namespace, three replicas, HTTP readiness, and placeholder secrets.",
+  },
+  nginx: {
+    namespace: "production",
+    replicas: 3,
+    cpu: "100m",
+    memory: "128Mi",
+    source: "curated Kubernetes workload profile",
+    description: "nginx stateless web workload with production namespace, three replicas, ingress, and conservative resources.",
+  },
+  redis: {
+    namespace: "production",
+    replicas: 1,
+    cpu: "250m",
+    memory: "512Mi",
+    source: "curated Kubernetes workload profile",
+    description: "Redis cache workload defaults to one replica and placeholder authentication. Add persistent storage before production.",
+  },
+  postgres: {
+    namespace: "production",
+    replicas: 1,
+    cpu: "500m",
+    memory: "1Gi",
+    source: "curated Kubernetes workload profile",
+    description: "PostgreSQL database workload defaults to one replica and placeholder credentials. Add persistent storage before production.",
+  },
+  ollama: {
+    namespace: "production",
+    replicas: 1,
+    cpu: "1000m",
+    memory: "4Gi",
+    source: "curated Kubernetes workload profile",
+    description: "Ollama model server workload defaults to one replica, larger memory, HTTP API health checks, and placeholder auth.",
+  },
+  node: {
+    namespace: "production",
+    replicas: 3,
+    cpu: "300m",
+    memory: "512Mi",
+    source: "curated Kubernetes workload profile",
+    description: "Generic Node.js stateless workload with three replicas, HTTP health checks, and production env defaults.",
+  },
+  python: {
+    namespace: "production",
+    replicas: 3,
+    cpu: "300m",
+    memory: "512Mi",
+    source: "curated Kubernetes workload profile",
+    description: "Generic Python stateless workload with three replicas, HTTP health checks, and production env defaults.",
+  },
+};
+
 function normalizeKey(value: string) {
   return value.toLowerCase().trim().replace(/^docker\.io\//, "").replace(/^ghcr\.io\//, "").replace(/^library\//, "");
 }
@@ -217,6 +292,26 @@ function inferPort(name: string) {
 function inferHealthPath(name: string) {
   const key = Object.keys(knownHealthPaths).find((candidate) => name.includes(candidate));
   return key ? knownHealthPaths[key] : "/health";
+}
+
+function inferReplicas(name: string) {
+  return [...statefulWorkloads].some((candidate) => name.includes(candidate)) ? 1 : 3;
+}
+
+function inferResources(name: string) {
+  if (name.includes("ollama")) {
+    return { cpu: "1000m", memory: "4Gi" };
+  }
+  if (["postgres", "postgresql"].some((candidate) => name.includes(candidate))) {
+    return { cpu: "500m", memory: "1Gi" };
+  }
+  if (name.includes("redis")) {
+    return { cpu: "250m", memory: "512Mi" };
+  }
+  if (["nginx", "httpd", "caddy"].some((candidate) => name.includes(candidate))) {
+    return { cpu: "100m", memory: "128Mi" };
+  }
+  return { cpu: "300m", memory: "512Mi" };
 }
 
 function fromDockerHub(repo: DockerHubRepository, query: string): ResolveSuggestion {
@@ -298,6 +393,25 @@ async function resolveFromDockerHub(query: string) {
   } satisfies ResolveSuggestion;
 }
 
+function withKubernetesDefaults(suggestion: ResolveSuggestion, query: string): ResolveSuggestion {
+  const normalizedQuery = normalizeKey(query);
+  const normalizedName = normalizeKey(suggestion.appName);
+  const profile = kubernetesProfiles[normalizedQuery] ?? kubernetesProfiles[slug(normalizedQuery)] ?? kubernetesProfiles[normalizedName];
+  const resources = inferResources(`${normalizedQuery} ${normalizedName}`);
+
+  return {
+    ...suggestion,
+    namespace: profile?.namespace ?? "production",
+    replicas: profile?.replicas ?? inferReplicas(`${normalizedQuery} ${normalizedName}`),
+    cpu: profile?.cpu ?? resources.cpu,
+    memory: profile?.memory ?? resources.memory,
+    ingressHost: profile?.ingressHost ?? `${slug(suggestion.appName)}.example.com`,
+    source: profile?.source ?? `${suggestion.source} + Kubernetes defaults`,
+    confidence: Math.min(profile ? suggestion.confidence + 0.01 : suggestion.confidence, 0.99),
+    description: profile?.description ?? `${suggestion.description} Kubernetes defaults use namespace production, inferred replicas, resource requests/limits, ingress host, and placeholder secrets.`,
+  };
+}
+
 export async function POST(request: Request) {
   let body: ResolveRequest;
 
@@ -310,19 +424,21 @@ export async function POST(request: Request) {
   const query = typeof body.query === "string" ? body.query.trim() : "";
   const target = typeof body.target === "string" ? body.target : "";
 
-  if (target !== "docker") {
-    return NextResponse.json({ error: "Only target=docker is supported." }, { status: 400 });
+  if (target !== "docker" && target !== "kubernetes") {
+    return NextResponse.json({ error: "target must be docker or kubernetes." }, { status: 400 });
   }
 
   if (!query) {
     return NextResponse.json({ error: "query is required." }, { status: 400 });
   }
 
+  const resolveTarget = target as ResolveTarget;
   const key = normalizeKey(query);
-  const suggestion = curated[key] ?? curated[slug(key)] ?? (await resolveFromDockerHub(query));
+  const dockerSuggestion = curated[key] ?? curated[slug(key)] ?? (await resolveFromDockerHub(query));
+  const suggestion = resolveTarget === "kubernetes" ? withKubernetesDefaults(dockerSuggestion, query) : dockerSuggestion;
 
   return NextResponse.json({
-    target: "docker",
+    target: resolveTarget,
     query,
     suggestion,
   });

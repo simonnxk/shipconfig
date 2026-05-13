@@ -22,6 +22,7 @@ type Preset = "node" | "python" | "go" | "static";
 type Tab = "dockerfile" | "compose" | "kubernetes" | "helm" | "actions";
 type Mode = "manual" | "auto";
 type ResolveStatus = "idle" | "loading" | "success" | "error";
+type ResolveTarget = "docker" | "kubernetes";
 
 type FormState = {
   preset: Preset;
@@ -51,10 +52,15 @@ type ResolveSuggestion = {
   confidence: number;
   description: string;
   preset?: Preset;
+  namespace?: string;
+  replicas?: number;
+  cpu?: string;
+  memory?: string;
+  ingressHost?: string;
 };
 
 type ResolveResponse = {
-  target: "docker";
+  target: ResolveTarget;
   query: string;
   suggestion: ResolveSuggestion;
 };
@@ -185,6 +191,7 @@ export default function Home() {
   const [active, setActive] = useState<Tab>("kubernetes");
   const [copied, setCopied] = useState<string>("");
   const [mode, setMode] = useState<Mode>("manual");
+  const [resolveTarget, setResolveTarget] = useState<ResolveTarget>("docker");
   const [resolveQuery, setResolveQuery] = useState("");
   const [resolveStatus, setResolveStatus] = useState<ResolveStatus>("idle");
   const [resolveError, setResolveError] = useState("");
@@ -218,7 +225,7 @@ export default function Home() {
       const response = await fetch("/api/resolve", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ target: "docker", query }),
+        body: JSON.stringify({ target: resolveTarget, query }),
       });
       const data = (await response.json()) as ResolveResponse | { error?: string };
 
@@ -246,7 +253,11 @@ export default function Home() {
       healthPath: next.healthPath,
       envVars: next.envVars,
       secrets: next.secrets,
-      ingressHost: `${slug(next.appName)}.example.com`,
+      namespace: next.namespace ?? prev.namespace,
+      replicas: next.replicas ?? prev.replicas,
+      cpu: next.cpu ?? prev.cpu,
+      memory: next.memory ?? prev.memory,
+      ingressHost: next.ingressHost ?? `${slug(next.appName)}.example.com`,
     }));
   }
 
@@ -343,11 +354,17 @@ export default function Home() {
                   <label className="grid gap-1.5 text-xs font-medium text-slate-400">
                     Target/source type
                     <select
-                      value="docker"
-                      disabled
+                      value={resolveTarget}
+                      onChange={(e) => {
+                        setResolveTarget(e.target.value as ResolveTarget);
+                        setSuggestion(null);
+                        setResolveStatus("idle");
+                        setResolveError("");
+                      }}
                       className="h-9 w-full rounded-lg border border-slate-800 bg-[#070a0f] px-3 text-sm font-normal text-slate-100 outline-none"
                     >
                       <option value="docker">Docker image</option>
+                      <option value="kubernetes">Kubernetes workload/config</option>
                     </select>
                   </label>
                   <label className="grid gap-1.5 text-xs font-medium text-slate-400">
@@ -375,7 +392,9 @@ export default function Home() {
                     </div>
                   </label>
                   <p className="text-xs leading-5 text-slate-500">
-                    Auto Resolve uses public image metadata plus curated templates; verify before production.
+                    {resolveTarget === "kubernetes"
+                      ? "Auto Resolve uses curated Kubernetes profiles plus public image metadata; verify before production."
+                      : "Auto Resolve uses curated image templates plus public Docker Hub metadata; verify before production."}
                   </p>
 
                   {resolveStatus === "loading" ? (
@@ -405,7 +424,11 @@ export default function Home() {
                       </div>
                       <div className="mt-3 grid gap-2 text-xs leading-5 text-slate-400">
                         <div>
-                          <span className="text-slate-500">Source:</span> {suggestion.source}
+                          <span className="text-slate-500">{resolveTarget === "kubernetes" ? "Kubernetes source" : "Image source"}:</span>{" "}
+                          {suggestion.source}
+                        </div>
+                        <div>
+                          <span className="text-slate-500">Confidence:</span> {Math.round(suggestion.confidence * 100)}%
                         </div>
                         <div>
                           <span className="text-slate-500">Description:</span> {suggestion.description}
@@ -414,6 +437,20 @@ export default function Home() {
                           <span className="text-slate-500">Port:</span> {suggestion.port}{" "}
                           <span className="text-slate-600">Health:</span> {suggestion.healthPath}
                         </div>
+                        {suggestion.replicas || suggestion.cpu || suggestion.memory ? (
+                          <div>
+                            {suggestion.replicas ? (
+                              <>
+                                <span className="text-slate-500">Replicas:</span> {suggestion.replicas}{" "}
+                              </>
+                            ) : null}
+                            {suggestion.cpu || suggestion.memory ? (
+                              <>
+                                <span className="text-slate-600">Resources:</span> {[suggestion.cpu, suggestion.memory].filter(Boolean).join(" / ")}
+                              </>
+                            ) : null}
+                          </div>
+                        ) : null}
                       </div>
                       <button
                         onClick={() => applySuggestion(suggestion)}
