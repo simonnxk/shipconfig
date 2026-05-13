@@ -1,0 +1,9 @@
+@import "tailwindcss";
+
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: #020617; }
+::selection { background: rgba(103,232,249,.35); }
+pre::-webkit-scrollbar, textarea::-webkit-scrollbar { width: 10px; height: 10px; }
+pre::-webkit-scrollbar-thumb, textarea::-webkit-scrollbar-thumb { background: rgba(148,163,184,.35); border-radius: 999px; }
