@@ -734,7 +734,6 @@ export default function Home() {
                             void resolveConfig();
                           }
                         }}
-                        placeholder="litellm"
                         className="h-8 min-w-0 rounded-md border border-slate-800 bg-[#070a0f] px-2.5 text-xs font-normal text-slate-200 outline-none transition placeholder:text-slate-600 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
                       />
                       <button
