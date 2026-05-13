@@ -561,6 +561,13 @@ export default function Home() {
     setForm((prev) => ({ ...prev, ...presets[preset], preset }));
   }
 
+  function selectResolveTarget(target: ResolveTarget) {
+    setResolveTarget(target);
+    setSuggestion(null);
+    setResolveStatus("idle");
+    setResolveError("");
+  }
+
   async function resolveConfig() {
     const query = resolveQuery.trim();
     if (!query) {
@@ -704,25 +711,31 @@ export default function Home() {
                     <Wand2 className="size-3" />
                     Auto Resolve
                   </div>
-                  <label className="grid gap-1 text-[11px] font-medium text-slate-500">
-                    Target/source type
-                    <select
-                      value={resolveTarget}
-                      onChange={(e) => {
-                        setResolveTarget(e.target.value as ResolveTarget);
-                        setSuggestion(null);
-                        setResolveStatus("idle");
-                        setResolveError("");
-                      }}
-                      className="h-8 w-full rounded-md border border-slate-800 bg-[#070a0f] px-2.5 text-xs font-normal text-slate-200 outline-none transition focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
-                    >
-                      {(Object.entries(resolveTargets) as [ResolveTarget, (typeof resolveTargets)[ResolveTarget]][]).map(([target, meta]) => (
-                        <option key={target} value={target}>
-                          {meta.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
+                  <div className="grid gap-1 text-[11px] font-medium text-slate-500">
+                    <div id="resolve-target-label">Target/source type</div>
+                    <div className="grid grid-cols-2 gap-1" role="radiogroup" aria-labelledby="resolve-target-label">
+                      {(Object.entries(resolveTargets) as [ResolveTarget, (typeof resolveTargets)[ResolveTarget]][]).map(([target, meta]) => {
+                        const isSelected = resolveTarget === target;
+
+                        return (
+                          <button
+                            key={target}
+                            type="button"
+                            role="radio"
+                            aria-checked={isSelected}
+                            onClick={() => selectResolveTarget(target)}
+                            className={`min-h-8 rounded-md border px-2 py-1.5 text-left text-[11px] font-medium leading-4 transition ${
+                              isSelected
+                                ? "border-sky-400/50 bg-sky-400/15 text-sky-100 shadow-[0_0_0_1px_rgba(56,189,248,0.08)_inset]"
+                                : "border-slate-800 bg-[#070a0f] text-slate-400 hover:border-slate-700 hover:bg-slate-900 hover:text-slate-200"
+                            }`}
+                          >
+                            {meta.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
                   <label className="grid gap-1 text-[11px] font-medium text-slate-500">
                     App or image query
                     <div className="grid gap-2 min-[390px]:grid-cols-[minmax(0,1fr)_auto]">
