@@ -13,10 +13,11 @@ import {
   Search,
   Server,
   Settings2,
+  Share2,
   TerminalSquare,
   Wand2,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 type Preset = "node" | "python" | "go" | "static";
 type Tab = "dockerfile" | "compose" | "kubernetes" | "helm" | "actions" | "testDeploy" | "readme";
@@ -74,6 +75,14 @@ type PreflightCheck = {
 
 type PreflightSummary = Record<CheckSeverity, number>;
 
+type PersistedState = {
+  version: 1;
+  form: FormState;
+  mode: Mode;
+  resolveTarget: ResolveTarget;
+  resolveQuery: string;
+};
+
 const presets: Record<Preset, Partial<FormState> & { label: string; description: string }> = {
   node: {
     label: "Node.js API",
@@ -124,10 +133,16 @@ const initial: FormState = {
   ingressHost: "api.example.com",
   healthPath: "/health",
   envVars: "NODE_ENV=production\nLOG_LEVEL=info",
-  secrets: "DATABASE_URL=postgres://user:pass@host:5432/app\nJWT_SECRET=change-me",
+  secrets: "DATABASE_URL=[DATABASE_URL_PLACEHOLDER]\nJWT_SECRET=[JWT_SECRET_PLACEHOLDER]",
   cpu: "500m",
   memory: "512Mi",
 };
+
+const STORAGE_KEY = "shipconfig.workbench.v1";
+const SHARE_PARAM = "shipconfig";
+const presetValues: Preset[] = ["node", "python", "go", "static"];
+const modeValues: Mode[] = ["manual", "auto"];
+const resolveTargetValues: ResolveTarget[] = ["docker", "kubernetes", "compose", "helm", "github-actions", "runtime"];
 
 const tabs: { id: Tab; label: string }[] = [
   { id: "dockerfile", label: "Dockerfile" },
@@ -196,6 +211,130 @@ function hasLatestTag(image: string) {
 
   const lastSegment = clean.split("/").at(-1) ?? "";
   return !lastSegment.includes(":");
+}
+
+function coerceString(value: unknown, fallback: string) {
+  return typeof value === "string" ? value : fallback;
+}
+
+function coerceNumber(value: unknown, fallback: number) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function coerceFormState(value: unknown): FormState | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const preset = presetValues.includes(value.preset as Preset) ? (value.preset as Preset) : initial.preset;
+
+  return {
+    preset,
+    appName: coerceString(value.appName, initial.appName),
+    image: coerceString(value.image, initial.image),
+    registry: coerceString(value.registry, initial.registry),
+    namespace: coerceString(value.namespace, initial.namespace),
+    port: coerceNumber(value.port, initial.port),
+    replicas: coerceNumber(value.replicas, initial.replicas),
+    ingressHost: coerceString(value.ingressHost, initial.ingressHost),
+    healthPath: coerceString(value.healthPath, initial.healthPath),
+    envVars: coerceString(value.envVars, initial.envVars),
+    secrets: coerceString(value.secrets, initial.secrets),
+    cpu: coerceString(value.cpu, initial.cpu),
+    memory: coerceString(value.memory, initial.memory),
+  };
+}
+
+function parsePersistedState(raw: string | null): PersistedState | null {
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) {
+      return null;
+    }
+
+    const form = coerceFormState(parsed.form);
+    if (!form) {
+      return null;
+    }
+
+    return {
+      version: 1,
+      form,
+      mode: modeValues.includes(parsed.mode as Mode) ? (parsed.mode as Mode) : "manual",
+      resolveTarget: resolveTargetValues.includes(parsed.resolveTarget as ResolveTarget)
+        ? (parsed.resolveTarget as ResolveTarget)
+        : "docker",
+      resolveQuery: coerceString(parsed.resolveQuery, ""),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseSharedState() {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  const queryValue = new URLSearchParams(window.location.search).get(SHARE_PARAM);
+  const hashValue = new URLSearchParams(window.location.hash.replace(/^#/, "")).get(SHARE_PARAM);
+  const encoded = queryValue || hashValue;
+  if (!encoded) {
+    return null;
+  }
+
+  const parsed = parsePersistedState(encoded);
+  if (parsed) {
+    return parsed;
+  }
+
+  try {
+    return parsePersistedState(decodeURIComponent(encoded));
+  } catch {
+    return null;
+  }
+}
+
+function imageWithPinnedPlaceholder(image: string) {
+  const clean = image.trim();
+  if (!clean) {
+    return image;
+  }
+
+  const lastSegment = clean.split("/").at(-1) ?? clean;
+  if (clean.endsWith(":latest")) {
+    return `${clean.slice(0, -"latest".length)}1.0.0`;
+  }
+
+  return lastSegment.includes(":") ? clean : `${clean}:1.0.0`;
+}
+
+function placeholderTokenFor(key: string) {
+  const token = key.trim().toUpperCase().replace(/[^A-Z0-9_]/g, "_").replace(/^_+|_+$/g, "") || "SECRET";
+  return `[${token}_PLACEHOLDER]`;
+}
+
+function replacePlaceholderSecrets(value: string) {
+  return value
+    .split("\n")
+    .map((line) => {
+      const [key, ...rest] = line.split("=");
+      if (!key || !rest.length) {
+        return line;
+      }
+
+      const secretValue = rest.join("=").trim();
+      return /change-me|changeme|replace-me|todo/i.test(secretValue) ? `${key.trim()}=${placeholderTokenFor(key)}` : line;
+    })
+    .join("\n");
 }
 
 function isStatefulNonHttpWorkload(form: FormState) {
@@ -529,6 +668,8 @@ export default function Home() {
   const [form, setForm] = useState<FormState>(initial);
   const [active, setActive] = useState<Tab>("kubernetes");
   const [copied, setCopied] = useState<string>("");
+  const [savedLocally, setSavedLocally] = useState(false);
+  const [hasLoadedClientState, setHasLoadedClientState] = useState(false);
   const [mode, setMode] = useState<Mode>("manual");
   const [resolveTarget, setResolveTarget] = useState<ResolveTarget>("docker");
   const [resolveQuery, setResolveQuery] = useState("");
@@ -538,6 +679,16 @@ export default function Home() {
   const files = useMemo(() => generateFiles(form), [form]);
   const preflightChecks = useMemo(() => buildPreflightChecks(form), [form]);
   const preflightSummary = useMemo(() => summarizeChecks(preflightChecks), [preflightChecks]);
+  const persistedState = useMemo<PersistedState>(
+    () => ({
+      version: 1,
+      form,
+      mode,
+      resolveTarget,
+      resolveQuery,
+    }),
+    [form, mode, resolveQuery, resolveTarget],
+  );
   const selected =
     active === "dockerfile"
       ? "Dockerfile"
@@ -556,6 +707,44 @@ export default function Home() {
   function update<K extends keyof FormState>(key: K, value: FormState[K]) {
     setForm((prev) => ({ ...prev, [key]: value }));
   }
+
+  function currentPersistedState(): PersistedState {
+    return persistedState;
+  }
+
+  useEffect(() => {
+    const sharedState = parseSharedState();
+    const storedState = parsePersistedState(window.localStorage.getItem(STORAGE_KEY));
+    const nextState = sharedState ?? storedState;
+
+    const loadTimer = window.setTimeout(() => {
+      if (nextState) {
+        setForm(nextState.form);
+        setMode(nextState.mode);
+        setResolveTarget(nextState.resolveTarget);
+        setResolveQuery(nextState.resolveQuery);
+      }
+
+      setHasLoadedClientState(true);
+    }, 0);
+
+    return () => window.clearTimeout(loadTimer);
+  }, []);
+
+  useEffect(() => {
+    if (!hasLoadedClientState) {
+      return;
+    }
+
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(persistedState));
+      const saveTimer = window.setTimeout(() => setSavedLocally(true), 0);
+      return () => window.clearTimeout(saveTimer);
+    } catch {
+      const saveTimer = window.setTimeout(() => setSavedLocally(false), 0);
+      return () => window.clearTimeout(saveTimer);
+    }
+  }, [hasLoadedClientState, persistedState]);
 
   function applyPreset(preset: Preset) {
     setForm((prev) => ({ ...prev, ...presets[preset], preset }));
@@ -627,6 +816,43 @@ export default function Home() {
     setTimeout(() => setCopied(""), 1500);
   }
 
+  async function shareConfig() {
+    const url = new URL(window.location.href);
+    url.hash = `${SHARE_PARAM}=${encodeURIComponent(JSON.stringify(currentPersistedState()))}`;
+    await copy(url.toString(), "share");
+  }
+
+  function fixPreflight(label: string) {
+    if (label === "Image tag") {
+      update("image", imageWithPinnedPlaceholder(form.image));
+      return;
+    }
+
+    if (label === "Secret placeholders") {
+      update("secrets", replacePlaceholderSecrets(form.secrets));
+      return;
+    }
+
+    if (label === "Ingress domain") {
+      update("ingressHost", "api.example.com");
+      return;
+    }
+
+    if (label === "Resources") {
+      setForm((prev) => ({ ...prev, cpu: initial.cpu, memory: initial.memory }));
+      return;
+    }
+
+    if (label === "Replicas") {
+      const replicas = Number.isFinite(form.replicas) ? form.replicas : initial.replicas;
+      update("replicas", Math.min(10, Math.max(1, Math.round(replicas))));
+    }
+  }
+
+  function canFixPreflight(label: string) {
+    return ["Image tag", "Secret placeholders", "Ingress domain", "Resources", "Replicas"].includes(label);
+  }
+
   async function downloadZip() {
     const zip = new JSZip();
     Object.entries(files).forEach(([path, content]) => zip.file(path, content));
@@ -659,10 +885,21 @@ export default function Home() {
               </div>
             </div>
             <div className="flex items-center gap-2">
+              <div className="inline-flex items-center gap-1.5 rounded-lg border border-slate-800 bg-slate-900/70 px-2.5 py-1.5 text-xs text-slate-400">
+                <CheckCircle2 className={`size-3.5 ${savedLocally ? "text-emerald-300" : "text-slate-600"}`} />
+                <span className="hidden min-[460px]:inline">Saved locally</span>
+              </div>
               <div className={`hidden items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs md:flex ${preflightSummary.fail ? "border-rose-500/30 bg-rose-500/10 text-rose-100" : preflightSummary.warn ? "border-amber-500/30 bg-amber-500/10 text-amber-200" : "border-emerald-500/25 bg-emerald-500/10 text-emerald-200"}`}>
                 {preflightSummary.fail || preflightSummary.warn ? <AlertTriangle className="size-3.5" /> : <CheckCircle2 className="size-3.5" />}
                 {preflightSummary.pass} pass / {preflightSummary.warn} warn / {preflightSummary.fail} fail
               </div>
+              <button
+                onClick={shareConfig}
+                className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-3 text-sm font-medium text-slate-200 transition hover:border-slate-600 hover:bg-slate-800"
+              >
+                <Share2 className="size-4" />
+                <span className="hidden sm:inline">{copied === "share" ? "Copied" : "Share"}</span>
+              </button>
               <button
                 onClick={downloadZip}
                 className="inline-flex h-9 items-center gap-2 rounded-lg border border-sky-400/30 bg-sky-400/15 px-3 text-sm font-medium text-sky-100 transition hover:border-sky-300/50 hover:bg-sky-400/20"
@@ -853,7 +1090,7 @@ export default function Home() {
                 </div>
               </section>
 
-              <section className="grid gap-3">
+              <section className="grid gap-3 rounded-lg border border-slate-800/80 bg-[#090d13]/45 p-3">
                 <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
                   <TerminalSquare className="size-3.5" />
                   Runtime
@@ -863,10 +1100,6 @@ export default function Home() {
                   ["Image", "image"],
                   ["Registry", "registry"],
                   ["Namespace", "namespace"],
-                  ["Ingress host", "ingressHost"],
-                  ["Health path", "healthPath"],
-                  ["CPU", "cpu"],
-                  ["Memory", "memory"],
                 ].map(([label, key]) => (
                   <label key={key} className="grid gap-1.5 text-xs font-medium text-slate-400">
                     {label}
@@ -877,6 +1110,21 @@ export default function Home() {
                     />
                   </label>
                 ))}
+              </section>
+
+              <section className="grid gap-3 rounded-lg border border-slate-800/80 bg-[#090d13]/45 p-3">
+                <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+                  <GitBranch className="size-3.5" />
+                  Networking
+                </div>
+                <label className="grid gap-1.5 text-xs font-medium text-slate-400">
+                  Ingress host
+                  <input
+                    value={form.ingressHost}
+                    onChange={(e) => update("ingressHost", e.target.value)}
+                    className="h-9 w-full rounded-lg border border-slate-800 bg-[#070a0f] px-3 text-sm font-normal text-slate-100 outline-none transition placeholder:text-slate-600 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                  />
+                </label>
                 <div className="grid grid-cols-2 gap-3">
                   <label className="grid gap-1.5 text-xs font-medium text-slate-400">
                     Port
@@ -888,6 +1136,23 @@ export default function Home() {
                     />
                   </label>
                   <label className="grid gap-1.5 text-xs font-medium text-slate-400">
+                    Health path
+                    <input
+                      value={form.healthPath}
+                      onChange={(e) => update("healthPath", e.target.value)}
+                      className="h-9 w-full rounded-lg border border-slate-800 bg-[#070a0f] px-3 text-sm font-normal text-slate-100 outline-none transition placeholder:text-slate-600 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                    />
+                  </label>
+                </div>
+              </section>
+
+              <section className="grid gap-3 rounded-lg border border-slate-800/80 bg-[#090d13]/45 p-3">
+                <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+                  <Server className="size-3.5" />
+                  Resources
+                </div>
+                <div className="grid gap-3 min-[390px]:grid-cols-3">
+                  <label className="grid gap-1.5 text-xs font-medium text-slate-400">
                     Replicas
                     <input
                       type="number"
@@ -896,10 +1161,26 @@ export default function Home() {
                       className="h-9 w-full rounded-lg border border-slate-800 bg-[#070a0f] px-3 text-sm font-normal text-slate-100 outline-none transition focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
                     />
                   </label>
+                  <label className="grid gap-1.5 text-xs font-medium text-slate-400">
+                    CPU
+                    <input
+                      value={form.cpu}
+                      onChange={(e) => update("cpu", e.target.value)}
+                      className="h-9 w-full rounded-lg border border-slate-800 bg-[#070a0f] px-3 text-sm font-normal text-slate-100 outline-none transition placeholder:text-slate-600 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                    />
+                  </label>
+                  <label className="grid gap-1.5 text-xs font-medium text-slate-400">
+                    Memory
+                    <input
+                      value={form.memory}
+                      onChange={(e) => update("memory", e.target.value)}
+                      className="h-9 w-full rounded-lg border border-slate-800 bg-[#070a0f] px-3 text-sm font-normal text-slate-100 outline-none transition placeholder:text-slate-600 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                    />
+                  </label>
                 </div>
               </section>
 
-              <section className="grid gap-3">
+              <section className="grid gap-3 rounded-lg border border-slate-800/80 bg-[#090d13]/45 p-3">
                 <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
                   <FileCode2 className="size-3.5" />
                   Environment
@@ -938,7 +1219,7 @@ export default function Home() {
                 </div>
                 <div className="grid gap-2">
                   {preflightChecks.map((check) => (
-                    <div key={check.label} className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-xs leading-5">
+                    <div key={check.label} className="grid grid-cols-[auto_minmax(0,1fr)_auto] gap-x-2 gap-y-0.5 text-xs leading-5">
                       <span
                         className={`mt-1 size-2 rounded-full ${
                           check.severity === "pass" ? "bg-emerald-400" : check.severity === "warn" ? "bg-amber-300" : "bg-rose-400"
@@ -948,6 +1229,15 @@ export default function Home() {
                         <div className="font-medium text-slate-300">{check.label}</div>
                         <div className="text-slate-500">{check.message}</div>
                       </div>
+                      {check.severity !== "pass" && canFixPreflight(check.label) ? (
+                        <button
+                          type="button"
+                          onClick={() => fixPreflight(check.label)}
+                          className="self-start rounded-md border border-slate-700 bg-slate-900 px-2 py-0.5 text-[11px] font-medium text-slate-300 transition hover:border-sky-400/40 hover:bg-slate-800 hover:text-sky-100"
+                        >
+                          Fix
+                        </button>
+                      ) : null}
                     </div>
                   ))}
                 </div>
