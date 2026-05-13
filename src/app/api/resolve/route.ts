@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
 type Preset = "node" | "python" | "go" | "static";
-type ResolveTarget = "docker" | "kubernetes";
+type ResolveTarget = "docker" | "kubernetes" | "compose" | "helm" | "github-actions" | "runtime";
 
 type ResolveRequest = {
   query?: unknown;
@@ -169,6 +169,7 @@ const knownHealthPaths: Record<string, string> = {
 };
 
 const statefulWorkloads = new Set(["postgres", "postgresql", "redis", "ollama"]);
+const resolveTargets = new Set<ResolveTarget>(["docker", "kubernetes", "compose", "helm", "github-actions", "runtime"]);
 
 const kubernetesProfiles: Record<string, Partial<ResolveSuggestion>> = {
   litellm: {
@@ -272,13 +273,16 @@ function withLatestTag(image: string) {
 }
 
 function inferPreset(name: string): Preset | undefined {
-  if (["node", "next", "express"].some((part) => name.includes(part))) {
+  if (["node", "next", "express", "nestjs", "fastify"].some((part) => name.includes(part))) {
     return "node";
   }
-  if (["python", "django", "fastapi", "flask"].some((part) => name.includes(part))) {
+  if (["python", "django", "fastapi", "flask", "uvicorn"].some((part) => name.includes(part))) {
     return "python";
   }
-  if (["nginx", "httpd", "caddy"].some((part) => name.includes(part))) {
+  if (["go", "golang", "gin", "fiber"].some((part) => name.includes(part))) {
+    return "go";
+  }
+  if (["nginx", "httpd", "caddy", "static", "spa", "vite", "react"].some((part) => name.includes(part))) {
     return "static";
   }
   return undefined;
@@ -412,6 +416,143 @@ function withKubernetesDefaults(suggestion: ResolveSuggestion, query: string): R
   };
 }
 
+function withComposeDefaults(suggestion: ResolveSuggestion, query: string): ResolveSuggestion {
+  const normalizedQuery = normalizeKey(query);
+  const normalizedName = normalizeKey(suggestion.appName);
+  const resources = inferResources(`${normalizedQuery} ${normalizedName}`);
+
+  return {
+    ...suggestion,
+    namespace: "local",
+    replicas: 1,
+    cpu: suggestion.cpu ?? resources.cpu,
+    memory: suggestion.memory ?? resources.memory,
+    ingressHost: "localhost",
+    source: `${suggestion.source} + curated Docker Compose profile`,
+    confidence: Math.min(suggestion.confidence + 0.01, 0.99),
+    description: `${suggestion.description} Docker Compose stack defaults favor local validation with namespace local, one replica, local port mapping, and placeholder secrets only.`,
+  };
+}
+
+function withHelmDefaults(suggestion: ResolveSuggestion, query: string): ResolveSuggestion {
+  const normalizedQuery = normalizeKey(query);
+  const normalizedName = normalizeKey(suggestion.appName);
+  const workloadName = `${normalizedQuery} ${normalizedName}`;
+  const resources = inferResources(workloadName);
+  const replicas = inferReplicas(workloadName) === 1 ? 1 : 3;
+
+  return {
+    ...withKubernetesDefaults(suggestion, query),
+    namespace: "production",
+    replicas,
+    cpu: resources.cpu,
+    memory: resources.memory,
+    source: `${suggestion.source} + curated Helm chart starter profile`,
+    confidence: Math.min(suggestion.confidence + 0.02, 0.99),
+    description: `${suggestion.description} Helm starter defaults target values.yaml/chart scaffolding with production namespace, ${replicas} replica${replicas === 1 ? "" : "s"}, resource values, ingress, and placeholder secrets.`,
+  };
+}
+
+function withGithubActionsDefaults(suggestion: ResolveSuggestion, query: string): ResolveSuggestion {
+  const normalizedQuery = normalizeKey(query);
+  const normalizedName = normalizeKey(suggestion.appName);
+  const resources = inferResources(`${normalizedQuery} ${normalizedName}`);
+  const shouldUseGhcr = suggestion.registry !== "docker.io" || suggestion.image.startsWith(`${slug(suggestion.appName)}:`);
+
+  return {
+    ...suggestion,
+    registry: shouldUseGhcr ? "ghcr.io" : suggestion.registry,
+    namespace: "production",
+    replicas: inferReplicas(`${normalizedQuery} ${normalizedName}`),
+    cpu: suggestion.cpu ?? resources.cpu,
+    memory: suggestion.memory ?? resources.memory,
+    ingressHost: `${slug(suggestion.appName)}.example.com`,
+    source: `${suggestion.source} + curated GitHub Actions workflow profile`,
+    confidence: Math.min(suggestion.confidence + 0.01, 0.99),
+    description: `${suggestion.description} GitHub Actions defaults are shaped for a build, push, and deploy workflow with GHCR where appropriate, Kubernetes apply, and placeholder secret keys only.`,
+  };
+}
+
+function runtimeDefaultsFor(preset: Preset | undefined) {
+  if (preset === "python") {
+    return {
+      port: 8000,
+      healthPath: "/healthz",
+      envVars: "PYTHONUNBUFFERED=1\nAPP_ENV=production",
+      secrets: "APP_SECRET_KEY=change-me",
+    };
+  }
+  if (preset === "go") {
+    return {
+      port: 8080,
+      healthPath: "/ready",
+      envVars: "GIN_MODE=release\nLOG_LEVEL=info",
+      secrets: "APP_SECRET=change-me",
+    };
+  }
+  if (preset === "static") {
+    return {
+      port: 80,
+      healthPath: "/",
+      envVars: "CACHE_CONTROL=max-age=3600",
+      secrets: "BASIC_AUTH_PASSWORD=change-me",
+    };
+  }
+  return {
+    port: 3000,
+    healthPath: "/health",
+    envVars: "NODE_ENV=production\nLOG_LEVEL=info",
+    secrets: "SESSION_SECRET=change-me",
+  };
+}
+
+function withRuntimeDefaults(suggestion: ResolveSuggestion, query: string): ResolveSuggestion {
+  const normalizedQuery = normalizeKey(query);
+  const normalizedName = normalizeKey(suggestion.appName);
+  const preset = suggestion.preset ?? inferPreset(`${normalizedQuery} ${normalizedName}`) ?? "node";
+  const defaults = runtimeDefaultsFor(preset);
+  const appName = slug(suggestion.appName || query);
+
+  return {
+    ...suggestion,
+    appName,
+    image: `${appName}:latest`,
+    registry: "ghcr.io/acme",
+    port: defaults.port,
+    healthPath: defaults.healthPath,
+    envVars: defaults.envVars,
+    secrets: defaults.secrets,
+    preset,
+    namespace: "production",
+    replicas: preset === "static" ? 2 : 3,
+    cpu: preset === "static" ? "100m" : "300m",
+    memory: preset === "static" ? "128Mi" : "512Mi",
+    ingressHost: `${appName}.example.com`,
+    source: `${suggestion.source} + curated runtime starter profile`,
+    confidence: Math.min(suggestion.confidence + 0.01, 0.96),
+    description: `${suggestion.description} Runtime starter defaults infer a ${preset} package layout with local build image naming, sensible ports/env, Kubernetes-ready replicas, and placeholder secret keys only.`,
+  };
+}
+
+function applyTargetDefaults(target: ResolveTarget, suggestion: ResolveSuggestion, query: string) {
+  if (target === "kubernetes") {
+    return withKubernetesDefaults(suggestion, query);
+  }
+  if (target === "compose") {
+    return withComposeDefaults(suggestion, query);
+  }
+  if (target === "helm") {
+    return withHelmDefaults(suggestion, query);
+  }
+  if (target === "github-actions") {
+    return withGithubActionsDefaults(suggestion, query);
+  }
+  if (target === "runtime") {
+    return withRuntimeDefaults(suggestion, query);
+  }
+  return suggestion;
+}
+
 export async function POST(request: Request) {
   let body: ResolveRequest;
 
@@ -424,8 +565,8 @@ export async function POST(request: Request) {
   const query = typeof body.query === "string" ? body.query.trim() : "";
   const target = typeof body.target === "string" ? body.target : "";
 
-  if (target !== "docker" && target !== "kubernetes") {
-    return NextResponse.json({ error: "target must be docker or kubernetes." }, { status: 400 });
+  if (!resolveTargets.has(target as ResolveTarget)) {
+    return NextResponse.json({ error: "target must be docker, kubernetes, compose, helm, github-actions, or runtime." }, { status: 400 });
   }
 
   if (!query) {
@@ -435,7 +576,7 @@ export async function POST(request: Request) {
   const resolveTarget = target as ResolveTarget;
   const key = normalizeKey(query);
   const dockerSuggestion = curated[key] ?? curated[slug(key)] ?? (await resolveFromDockerHub(query));
-  const suggestion = resolveTarget === "kubernetes" ? withKubernetesDefaults(dockerSuggestion, query) : dockerSuggestion;
+  const suggestion = applyTargetDefaults(resolveTarget, dockerSuggestion, query);
 
   return NextResponse.json({
     target: resolveTarget,

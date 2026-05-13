@@ -22,7 +22,7 @@ type Preset = "node" | "python" | "go" | "static";
 type Tab = "dockerfile" | "compose" | "kubernetes" | "helm" | "actions" | "testDeploy" | "readme";
 type Mode = "manual" | "auto";
 type ResolveStatus = "idle" | "loading" | "success" | "error";
-type ResolveTarget = "docker" | "kubernetes";
+type ResolveTarget = "docker" | "kubernetes" | "compose" | "helm" | "github-actions" | "runtime";
 type CheckSeverity = "pass" | "warn" | "fail";
 
 type FormState = {
@@ -138,6 +138,39 @@ const tabs: { id: Tab; label: string }[] = [
   { id: "testDeploy", label: "test-deploy.sh" },
   { id: "readme", label: "README.md" },
 ];
+
+const resolveTargets: Record<ResolveTarget, { label: string; helper: string; sourceLabel: string }> = {
+  docker: {
+    label: "Docker image",
+    helper: "Auto Resolve uses curated image templates plus public Docker Hub metadata; verify before production.",
+    sourceLabel: "Image source",
+  },
+  kubernetes: {
+    label: "Kubernetes workload",
+    helper: "Auto Resolve uses curated Kubernetes profiles plus public image metadata; verify before production.",
+    sourceLabel: "Kubernetes source",
+  },
+  compose: {
+    label: "Compose stack",
+    helper: "Auto Resolve favors local Docker Compose validation defaults with one replica and localhost-style settings.",
+    sourceLabel: "Compose source",
+  },
+  helm: {
+    label: "Helm starter",
+    helper: "Auto Resolve shapes values.yaml and chart starter defaults for Kubernetes deployment.",
+    sourceLabel: "Helm source",
+  },
+  "github-actions": {
+    label: "GitHub Actions",
+    helper: "Auto Resolve prepares CI/CD defaults for build, push, and deploy workflows.",
+    sourceLabel: "Workflow source",
+  },
+  runtime: {
+    label: "Runtime/package",
+    helper: "Auto Resolve infers Node, Python, Go, or static starter defaults from the app query.",
+    sourceLabel: "Runtime source",
+  },
+};
 
 function slug(value: string) {
   return value.toLowerCase().trim().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "app";
@@ -683,8 +716,11 @@ export default function Home() {
                       }}
                       className="h-8 w-full rounded-md border border-slate-800 bg-[#070a0f] px-2.5 text-xs font-normal text-slate-200 outline-none transition focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
                     >
-                      <option value="docker">Docker image</option>
-                      <option value="kubernetes">Kubernetes workload/config</option>
+                      {(Object.entries(resolveTargets) as [ResolveTarget, (typeof resolveTargets)[ResolveTarget]][]).map(([target, meta]) => (
+                        <option key={target} value={target}>
+                          {meta.label}
+                        </option>
+                      ))}
                     </select>
                   </label>
                   <label className="grid gap-1 text-[11px] font-medium text-slate-500">
@@ -712,14 +748,12 @@ export default function Home() {
                     </div>
                   </label>
                   <p className="text-[11px] leading-4 text-slate-500">
-                    {resolveTarget === "kubernetes"
-                      ? "Auto Resolve uses curated Kubernetes profiles plus public image metadata; verify before production."
-                      : "Auto Resolve uses curated image templates plus public Docker Hub metadata; verify before production."}
+                    {resolveTargets[resolveTarget].helper}
                   </p>
 
                   {resolveStatus === "loading" ? (
                     <div className="rounded-md border border-slate-800 bg-[#070a0f] px-2.5 py-2 text-[11px] text-slate-400">
-                      Resolving image metadata and template hints...
+                      Resolving metadata and template hints...
                     </div>
                   ) : null}
 
@@ -744,7 +778,7 @@ export default function Home() {
                       </div>
                       <div className="mt-2 grid gap-1.5 text-[11px] leading-4 text-slate-400">
                         <div>
-                          <span className="text-slate-500">{resolveTarget === "kubernetes" ? "Kubernetes source" : "Image source"}:</span>{" "}
+                          <span className="text-slate-500">{resolveTargets[resolveTarget].sourceLabel}:</span>{" "}
                           {suggestion.source}
                         </div>
                         <div>
