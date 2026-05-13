@@ -5,16 +5,22 @@ import {
   AlertTriangle,
   CheckCircle2,
   Copy,
+  Moon,
   Download,
   FileCode2,
   GitBranch,
   Layers3,
   Loader2,
+  Plus,
+  Redo2,
   Search,
   Server,
   Settings2,
   Share2,
+  Sun,
   TerminalSquare,
+  Trash2,
+  Undo2,
   Wand2,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
@@ -25,6 +31,7 @@ type Mode = "manual" | "auto";
 type ResolveStatus = "idle" | "loading" | "success" | "error";
 type ResolveTarget = "docker" | "kubernetes" | "compose" | "helm" | "github-actions" | "runtime";
 type CheckSeverity = "pass" | "warn" | "fail";
+type Theme = "dark" | "light";
 
 type FormState = {
   preset: Preset;
@@ -40,6 +47,10 @@ type FormState = {
   secrets: string;
   cpu: string;
   memory: string;
+};
+
+type ServiceConfig = FormState & {
+  id: string;
 };
 
 type ResolveSuggestion = {
@@ -71,16 +82,28 @@ type PreflightCheck = {
   label: string;
   message: string;
   severity: CheckSeverity;
+  group: "runtime" | "security" | "network" | "operations";
 };
 
 type PreflightSummary = Record<CheckSeverity, number>;
 
 type PersistedState = {
-  version: 1;
-  form: FormState;
+  version: 2;
+  form?: FormState;
+  services: ServiceConfig[];
+  activeServiceId: string;
   mode: Mode;
   resolveTarget: ResolveTarget;
   resolveQuery: string;
+  theme: Theme;
+};
+
+type HistoryState = Pick<PersistedState, "services" | "activeServiceId" | "mode" | "resolveTarget" | "resolveQuery" | "theme">;
+
+type ScoreResult = {
+  score: number;
+  grade: string;
+  recommendations: string[];
 };
 
 const presets: Record<Preset, Partial<FormState> & { label: string; description: string }> = {
@@ -136,6 +159,11 @@ const initial: FormState = {
   secrets: "DATABASE_URL=[DATABASE_URL_PLACEHOLDER]\nJWT_SECRET=[JWT_SECRET_PLACEHOLDER]",
   cpu: "500m",
   memory: "512Mi",
+};
+
+const initialService: ServiceConfig = {
+  ...initial,
+  id: "svc-node-api",
 };
 
 const STORAGE_KEY = "shipconfig.workbench.v1";
@@ -249,6 +277,31 @@ function coerceFormState(value: unknown): FormState | null {
   };
 }
 
+function makeServiceId() {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `svc-${crypto.randomUUID()}`;
+  }
+
+  return `svc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function coerceServiceConfig(value: unknown, fallbackId = makeServiceId()): ServiceConfig | null {
+  const form = coerceFormState(value);
+  if (!form) {
+    return null;
+  }
+
+  const id = isRecord(value) ? coerceString(value.id, fallbackId) : fallbackId;
+  return { ...form, id };
+}
+
+function cloneHistoryState(state: HistoryState): HistoryState {
+  return {
+    ...state,
+    services: state.services.map((service) => ({ ...service })),
+  };
+}
+
 function parsePersistedState(raw: string | null): PersistedState | null {
   if (!raw) {
     return null;
@@ -260,19 +313,27 @@ function parsePersistedState(raw: string | null): PersistedState | null {
       return null;
     }
 
-    const form = coerceFormState(parsed.form);
-    if (!form) {
+    const legacyForm = coerceFormState(parsed.form);
+    const servicesFromState = Array.isArray(parsed.services)
+      ? parsed.services.map((service, index) => coerceServiceConfig(service, `svc-${index + 1}`)).filter((service): service is ServiceConfig => Boolean(service))
+      : [];
+    const services = servicesFromState.length ? servicesFromState : legacyForm ? [{ ...legacyForm, id: "svc-node-api" }] : [];
+    if (!services.length) {
       return null;
     }
 
+    const activeServiceId = coerceString(parsed.activeServiceId, services[0].id);
+
     return {
-      version: 1,
-      form,
+      version: 2,
+      services,
+      activeServiceId: services.some((service) => service.id === activeServiceId) ? activeServiceId : services[0].id,
       mode: modeValues.includes(parsed.mode as Mode) ? (parsed.mode as Mode) : "manual",
       resolveTarget: resolveTargetValues.includes(parsed.resolveTarget as ResolveTarget)
         ? (parsed.resolveTarget as ResolveTarget)
         : "docker",
       resolveQuery: coerceString(parsed.resolveQuery, ""),
+      theme: parsed.theme === "light" ? "light" : "dark",
     };
   } catch {
     return null;
@@ -361,16 +422,19 @@ function buildPreflightChecks(form: FormState): PreflightCheck[] {
   return [
     {
       label: "Required fields",
+      group: "runtime",
       severity: requiredFields.every(Boolean) && portSane ? "pass" : "fail",
       message: requiredFields.every(Boolean) && portSane ? "Core runtime fields are present." : "App, image, registry, namespace, health path, and a valid port are required.",
     },
     {
       label: "Secret placeholders",
+      group: "security",
       severity: hasSecretPlaceholders ? "warn" : "pass",
       message: hasSecretPlaceholders ? "One or more secrets still use change-me style placeholders." : "No obvious placeholder secrets detected.",
     },
     {
       label: "HTTP probes",
+      group: "operations",
       severity: isStatefulNonHttpWorkload(form) && healthPathLooksHttp ? "warn" : healthPathLooksHttp ? "pass" : "fail",
       message:
         isStatefulNonHttpWorkload(form) && healthPathLooksHttp
@@ -381,21 +445,25 @@ function buildPreflightChecks(form: FormState): PreflightCheck[] {
     },
     {
       label: "Image tag",
+      group: "security",
       severity: hasLatestTag(form.image) ? "warn" : "pass",
       message: hasLatestTag(form.image) ? "Pin an immutable image tag before production deployment." : "Image tag is pinned.",
     },
     {
       label: "Resources",
+      group: "operations",
       severity: hasResources ? "pass" : "warn",
       message: hasResources ? "CPU and memory requests/limits are present." : "CPU and memory values should be set for Kubernetes.",
     },
     {
       label: "Ingress domain",
+      group: "network",
       severity: ingressHost.includes(".") ? "pass" : "warn",
       message: ingressHost.includes(".") ? "Ingress host looks like a DNS name." : "Ingress host should be a real domain before exposing traffic.",
     },
     {
       label: "Replicas",
+      group: "operations",
       severity: replicasSane ? "pass" : "warn",
       message: replicasSane ? "Replica count is in a normal smoke-test range." : "Use at least 1 replica and review high counts before testing.",
     },
@@ -425,23 +493,33 @@ function dockerfileFor(preset: Preset, port: number) {
   return `FROM node:22-alpine AS deps\nWORKDIR /app\nCOPY package*.json ./\nRUN npm ci --omit=dev\n\nFROM node:22-alpine AS runtime\nWORKDIR /app\nENV NODE_ENV=production\nCOPY --from=deps /app/node_modules ./node_modules\nCOPY . .\nEXPOSE ${port}\nCMD ["npm", "start"]\n`;
 }
 
-function testDeployScriptFor(form: FormState) {
-  const name = slug(form.appName);
+function fullImageFor(service: FormState) {
+  return `${service.registry.replace(/\/$/, "")}/${service.image}`;
+}
+
+function healthPathFor(service: FormState) {
+  return service.healthPath.startsWith("/") ? service.healthPath : `/${service.healthPath}`;
+}
+
+function yamlString(value: string | number) {
+  return String(value).replaceAll('"', '\\"');
+}
+
+function testDeployScriptFor(services: ServiceConfig[], primary: ServiceConfig) {
+  const name = slug(primary.appName);
   const smokeNamespace = `shipconfig-smoke-${name}`;
-  const healthPath = form.healthPath.startsWith("/") ? form.healthPath : `/${form.healthPath}`;
+  const serviceNames = services.map((service) => slug(service.appName)).join(" ");
 
   return `#!/usr/bin/env bash
 set -euo pipefail
 
-# ShipConfig no-side-effect validation plan for ${name}.
+# ShipConfig no-side-effect validation plan for ${services.length} service(s).
 # Run this from the directory containing Dockerfile, docker-compose.yml, and k8s.yaml.
 # The default commands validate syntax and perform Kubernetes dry-runs only.
 # Smoke commands use a temporary namespace (${smokeNamespace}) and are opt-in.
 
-APP_NAME="${name}"
 SMOKE_NAMESPACE="${smokeNamespace}"
-APP_PORT="${form.port}"
-HEALTH_PATH="${healthPath}"
+SERVICE_NAMES="${serviceNames}"
 
 echo "== Docker Compose validation =="
 docker compose -f docker-compose.yml config --quiet
@@ -452,7 +530,7 @@ kubectl apply --dry-run=client -f k8s.yaml
 
 echo "== Kubernetes server-side dry-run =="
 kubectl create namespace "$SMOKE_NAMESPACE" --dry-run=client -o yaml | kubectl apply --dry-run=server -f -
-sed "s/namespace: ${form.namespace}/namespace: $SMOKE_NAMESPACE/g; s/name: ${form.namespace}/name: $SMOKE_NAMESPACE/g" k8s.yaml | kubectl apply --dry-run=server -f -
+sed "s/namespace: ${primary.namespace}/namespace: $SMOKE_NAMESPACE/g; s/name: ${primary.namespace}/name: $SMOKE_NAMESPACE/g" k8s.yaml | kubectl apply --dry-run=server -f -
 
 cat <<NEXT_STEPS
 
@@ -462,10 +540,11 @@ Optional local cluster smoke test:
   # minikube start
 
   kubectl create namespace "$SMOKE_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-  sed "s/namespace: ${form.namespace}/namespace: $SMOKE_NAMESPACE/g; s/name: ${form.namespace}/name: $SMOKE_NAMESPACE/g" k8s.yaml | kubectl apply -f -
-  kubectl -n "$SMOKE_NAMESPACE" rollout status "deployment/$APP_NAME" --timeout=120s
-  kubectl -n "$SMOKE_NAMESPACE" port-forward "svc/$APP_NAME" "8080:80"
-  curl -fsS "http://127.0.0.1:8080$HEALTH_PATH"
+  sed "s/namespace: ${primary.namespace}/namespace: $SMOKE_NAMESPACE/g; s/name: ${primary.namespace}/name: $SMOKE_NAMESPACE/g" k8s.yaml | kubectl apply -f -
+  for service in $SERVICE_NAMES; do
+    kubectl -n "$SMOKE_NAMESPACE" rollout status "deployment/$service" --timeout=120s
+  done
+  kubectl -n "$SMOKE_NAMESPACE" get deploy,svc,ingress
 
 Cleanup:
   kubectl delete namespace "$SMOKE_NAMESPACE" --ignore-not-found
@@ -483,40 +562,33 @@ function markdownValue(value: string | number) {
   return String(value).replaceAll("`", "'");
 }
 
-function readmeFor(form: FormState, image: string) {
-  const name = slug(form.appName);
-  const healthPath = form.healthPath.startsWith("/") ? form.healthPath : `/${form.healthPath}`;
+function readmeFor(services: ServiceConfig[], primary: ServiceConfig) {
+  const name = slug(primary.appName);
   const smokeNamespace = `shipconfig-smoke-${name}`;
-  const envNames = parsePairs(form.envVars).map((pair) => pair.key);
-  const secretNames = parsePairs(form.secrets).map((pair) => pair.key);
+  const serviceRows = services
+    .map((service) => {
+      const serviceName = slug(service.appName);
+      const envNames = parsePairs(service.envVars).map((pair) => pair.key);
+      const secretNames = parsePairs(service.secrets).map((pair) => pair.key);
+      return `| \`${markdownValue(serviceName)}\` | \`${markdownValue(fullImageFor(service))}\` | \`${markdownValue(service.port)}\` | \`${markdownValue(service.replicas)}\` | \`${markdownValue(service.ingressHost)}\` | ${envNames.length ? envNames.map((key) => `\`${markdownValue(key)}\``).join(", ") : "\`APP_ENV\`"} | ${secretNames.length ? secretNames.map((key) => `\`${markdownValue(key)}\``).join(", ") : "\`EXAMPLE_SECRET\`"} |`;
+    })
+    .join("\n");
 
   return `# ${name}
 
-Generated by ShipConfig for \`${markdownValue(form.appName)}\`.
+Generated by ShipConfig for \`${markdownValue(primary.appName)}\` with ${services.length} service(s).
 
-## App and Config Summary
+## Services
 
-| Setting | Value |
-| --- | --- |
-| App name | \`${markdownValue(form.appName)}\` |
-| Slug/name used in manifests | \`${markdownValue(name)}\` |
-| Image | \`${markdownValue(image)}\` |
-| Registry | \`${markdownValue(form.registry)}\` |
-| Namespace | \`${markdownValue(form.namespace)}\` |
-| Container port | \`${markdownValue(form.port)}\` |
-| Replicas | \`${markdownValue(form.replicas)}\` |
-| Ingress host | \`${markdownValue(form.ingressHost)}\` |
-| Health path | \`${markdownValue(healthPath)}\` |
-| CPU request/limit | \`${markdownValue(form.cpu)}\` |
-| Memory request/limit | \`${markdownValue(form.memory)}\` |
-| Config env keys | ${envNames.length ? envNames.map((key) => `\`${markdownValue(key)}\``).join(", ") : "\`APP_ENV\`"} |
-| Secret placeholder keys | ${secretNames.length ? secretNames.map((key) => `\`${markdownValue(key)}\``).join(", ") : "\`EXAMPLE_SECRET\`"} |
+| Service | Image | Port | Replicas | Ingress host | Config env keys | Secret placeholder keys |
+| --- | --- | --- | --- | --- | --- | --- |
+${serviceRows}
 
 ## Generated Files
 
-- \`Dockerfile\`: Container build template for the selected runtime preset.
-- \`docker-compose.yml\`: Local Compose service with port mapping, environment entries, and health check.
-- \`k8s.yaml\`: Namespace, ConfigMap, Secret placeholder, Deployment, Service, and Ingress.
+- \`Dockerfile\`: Container build template for the active service runtime preset.
+- \`docker-compose.yml\`: Local Compose stack for every configured service.
+- \`k8s.yaml\`: Namespace, ConfigMap, Secret placeholder, Deployment, Service, and Ingress blocks for every service.
 - \`helm/Chart-and-values.yaml\`: Starter Helm chart content and values.
 - \`.github/workflows/deploy.yml\`: GitHub Actions build/push/deploy workflow starter.
 - \`test-deploy.sh\`: Validation helper with no-side-effect defaults and opt-in smoke-test commands.
@@ -527,13 +599,13 @@ Generated by ShipConfig for \`${markdownValue(form.appName)}\`.
 1. Put these generated files at the root of your application repository.
 2. Review the image name, namespace, ingress host, resource values, and health path.
 3. Replace secret placeholders through your secret-management workflow before any real deployment.
-4. Build locally:
+4. Build the active service image locally:
 
 \`\`\`bash
-docker build -t ${image} .
+docker build -t ${fullImageFor(primary)} .
 \`\`\`
 
-5. Run the local Compose config if your app dependencies are available:
+5. Run the local Compose stack if your app dependencies are available:
 
 \`\`\`bash
 docker compose up --build
@@ -560,7 +632,7 @@ If you have access to a cluster API server, run server-side validation against a
 
 \`\`\`bash
 kubectl create namespace ${smokeNamespace} --dry-run=client -o yaml | kubectl apply --dry-run=server -f -
-sed "s/namespace: ${form.namespace}/namespace: ${smokeNamespace}/g; s/name: ${form.namespace}/name: ${smokeNamespace}/g" k8s.yaml | kubectl apply --dry-run=server -f -
+sed "s/namespace: ${primary.namespace}/namespace: ${smokeNamespace}/g; s/name: ${primary.namespace}/name: ${smokeNamespace}/g" k8s.yaml | kubectl apply --dry-run=server -f -
 \`\`\`
 
 You can also run:
@@ -581,18 +653,17 @@ kind create cluster --name shipconfig-smoke
 # minikube start
 
 kubectl create namespace ${smokeNamespace} --dry-run=client -o yaml | kubectl apply -f -
-sed "s/namespace: ${form.namespace}/namespace: ${smokeNamespace}/g; s/name: ${form.namespace}/name: ${smokeNamespace}/g" k8s.yaml | kubectl apply -f -
-kubectl -n ${smokeNamespace} rollout status deployment/${name} --timeout=120s
-kubectl -n ${smokeNamespace} port-forward svc/${name} 8080:80
-curl -fsS http://127.0.0.1:8080${healthPath}
+sed "s/namespace: ${primary.namespace}/namespace: ${smokeNamespace}/g; s/name: ${primary.namespace}/name: ${smokeNamespace}/g" k8s.yaml | kubectl apply -f -
+${services.map((service) => `kubectl -n ${smokeNamespace} rollout status deployment/${slug(service.appName)} --timeout=120s`).join("\n")}
+kubectl -n ${smokeNamespace} get deploy,svc,ingress
 \`\`\`
 
 ## Deployment Checklist
 
-- Confirm \`${markdownValue(image)}\` exists in the registry and uses an immutable tag before production.
-- Verify \`${markdownValue(form.ingressHost)}\` points at the intended ingress controller.
-- Confirm the app listens on port \`${markdownValue(form.port)}\` inside the container.
-- Confirm \`${markdownValue(healthPath)}\` returns success for readiness and liveness.
+- Confirm each configured image exists in the registry and uses an immutable tag before production.
+- Verify each ingress host points at the intended ingress controller.
+- Confirm each app listens on the configured container port.
+- Confirm each health path returns success for readiness and liveness.
 - Review replicas, CPU, and memory against expected traffic.
 - Confirm RBAC, image pull secrets, ingress class, TLS, and network policies for the target cluster.
 - Run both Compose validation and Kubernetes dry-run validation before applying.
@@ -626,46 +697,91 @@ kind delete cluster --name shipconfig-smoke
 - Build fails: verify the Dockerfile matches your project layout and package manager.
 - Image pull fails: verify registry login, repository name, tag, and image pull secret configuration.
 - Pods stay pending: inspect resource requests, node capacity, taints, tolerations, and namespace quotas.
-- Rollout fails: run \`kubectl -n ${form.namespace} describe deployment/${name}\` and inspect pod events.
-- Health checks fail: verify the app serves \`${markdownValue(healthPath)}\` on container port \`${markdownValue(form.port)}\`.
+- Rollout fails: run \`kubectl -n ${primary.namespace} describe deployment/${name}\` and inspect pod events.
+- Health checks fail: verify the app serves its health path on the configured container port.
 - Ingress returns 404 or timeout: verify ingress class, DNS, service name, service port, and controller logs.
 - Server dry-run fails: confirm your kubeconfig points at a reachable cluster and your user has validation permissions.
 `;
 }
 
-function generateFiles(form: FormState) {
-  const name = slug(form.appName);
-  const image = `${form.registry.replace(/\/$/, "")}/${form.image}`;
-  const env = parsePairs(form.envVars);
-  const secrets = parsePairs(form.secrets);
+function composeServiceFor(service: ServiceConfig, isPrimary: boolean) {
+  const name = slug(service.appName);
+  const env = [...parsePairs(service.envVars), ...parsePairs(service.secrets)];
+  const composeEnv = env.map((p) => `      ${p.key}: ${p.value}`).join("\n");
+  const buildBlock = isPrimary ? "    build:\n      context: .\n      dockerfile: Dockerfile\n" : "";
+
+  return `  ${name}:\n${buildBlock}    image: ${fullImageFor(service)}\n    container_name: ${name}\n    restart: unless-stopped\n    ports:\n      - "${service.port}:${service.port}"\n    environment:\n${composeEnv || "      APP_ENV: production"}\n    healthcheck:\n      test: ["CMD-SHELL", "wget -qO- http://localhost:${service.port}${healthPathFor(service)} || exit 1"]\n      interval: 30s\n      timeout: 5s\n      retries: 3`;
+}
+
+function kubernetesServiceFor(service: ServiceConfig) {
+  const name = slug(service.appName);
+  const env = parsePairs(service.envVars);
+  const secrets = parsePairs(service.secrets);
   const envBlock = env.map((p) => `            - name: ${p.key}\n              valueFrom:\n                configMapKeyRef:\n                  name: ${name}-config\n                  key: ${p.key}`).join("\n");
   const secretBlock = secrets.map((p) => `            - name: ${p.key}\n              valueFrom:\n                secretKeyRef:\n                  name: ${name}-secret\n                  key: ${p.key}`).join("\n");
-  const cmData = env.map((p) => `  ${p.key}: "${p.value.replaceAll('"', '\\"')}"`).join("\n") || "  APP_ENV: \"production\"";
-  const secretData = secrets.map((p) => `  ${p.key}: "${p.value.replaceAll('"', '\\"')}"`).join("\n") || "  EXAMPLE_SECRET: \"change-me\"";
+  const cmData = env.map((p) => `  ${p.key}: "${yamlString(p.value)}"`).join("\n") || '  APP_ENV: "production"';
+  const secretData = secrets.map((p) => `  ${p.key}: "${yamlString(p.value)}"`).join("\n") || '  EXAMPLE_SECRET: "[EXAMPLE_SECRET_PLACEHOLDER]"';
 
-  const composeEnv = [...env, ...secrets].map((p) => `      ${p.key}: ${p.value}`).join("\n");
-  const compose = `services:\n  ${name}:\n    build:\n      context: .\n      dockerfile: Dockerfile\n    image: ${image}\n    container_name: ${name}\n    restart: unless-stopped\n    ports:\n      - "${form.port}:${form.port}"\n    environment:\n${composeEnv || "      APP_ENV: production"}\n    healthcheck:\n      test: ["CMD-SHELL", "wget -qO- http://localhost:${form.port}${form.healthPath} || exit 1"]\n      interval: 30s\n      timeout: 5s\n      retries: 3\n`;
+  return `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: ${name}-config\n  namespace: ${service.namespace}\ndata:\n${cmData}\n---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: ${name}-secret\n  namespace: ${service.namespace}\ntype: Opaque\nstringData:\n${secretData}\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: ${name}\n  namespace: ${service.namespace}\nspec:\n  replicas: ${service.replicas}\n  selector:\n    matchLabels:\n      app: ${name}\n  template:\n    metadata:\n      labels:\n        app: ${name}\n    spec:\n      containers:\n        - name: ${name}\n          image: ${fullImageFor(service)}\n          ports:\n            - containerPort: ${service.port}\n          env:\n${envBlock}${envBlock && secretBlock ? "\n" : ""}${secretBlock || "            - name: APP_ENV\n              value: production"}\n          resources:\n            requests:\n              cpu: ${service.cpu || initial.cpu}\n              memory: ${service.memory || initial.memory}\n            limits:\n              cpu: ${service.cpu || initial.cpu}\n              memory: ${service.memory || initial.memory}\n          readinessProbe:\n            httpGet:\n              path: ${healthPathFor(service)}\n              port: ${service.port}\n            initialDelaySeconds: 10\n            periodSeconds: 10\n          livenessProbe:\n            httpGet:\n              path: ${healthPathFor(service)}\n              port: ${service.port}\n            initialDelaySeconds: 30\n            periodSeconds: 20\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: ${name}\n  namespace: ${service.namespace}\nspec:\n  selector:\n    app: ${name}\n  ports:\n    - name: http\n      port: 80\n      targetPort: ${service.port}\n---\napiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: ${name}\n  namespace: ${service.namespace}\n  annotations:\n    kubernetes.io/ingress.class: nginx\nspec:\n  rules:\n    - host: ${service.ingressHost}\n      http:\n        paths:\n          - path: /\n            pathType: Prefix\n            backend:\n              service:\n                name: ${name}\n                port:\n                  number: 80`;
+}
 
-  const kubernetes = `apiVersion: v1\nkind: Namespace\nmetadata:\n  name: ${form.namespace}\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: ${name}-config\n  namespace: ${form.namespace}\ndata:\n${cmData}\n---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: ${name}-secret\n  namespace: ${form.namespace}\ntype: Opaque\nstringData:\n${secretData}\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: ${name}\n  namespace: ${form.namespace}\nspec:\n  replicas: ${form.replicas}\n  selector:\n    matchLabels:\n      app: ${name}\n  template:\n    metadata:\n      labels:\n        app: ${name}\n    spec:\n      containers:\n        - name: ${name}\n          image: ${image}\n          ports:\n            - containerPort: ${form.port}\n          env:\n${envBlock}${envBlock && secretBlock ? "\n" : ""}${secretBlock || "            - name: APP_ENV\n              value: production"}\n          resources:\n            requests:\n              cpu: ${form.cpu}\n              memory: ${form.memory}\n            limits:\n              cpu: ${form.cpu}\n              memory: ${form.memory}\n          readinessProbe:\n            httpGet:\n              path: ${form.healthPath}\n              port: ${form.port}\n            initialDelaySeconds: 10\n            periodSeconds: 10\n          livenessProbe:\n            httpGet:\n              path: ${form.healthPath}\n              port: ${form.port}\n            initialDelaySeconds: 30\n            periodSeconds: 20\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: ${name}\n  namespace: ${form.namespace}\nspec:\n  selector:\n    app: ${name}\n  ports:\n    - name: http\n      port: 80\n      targetPort: ${form.port}\n---\napiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: ${name}\n  namespace: ${form.namespace}\n  annotations:\n    kubernetes.io/ingress.class: nginx\nspec:\n  rules:\n    - host: ${form.ingressHost}\n      http:\n        paths:\n          - path: /\n            pathType: Prefix\n            backend:\n              service:\n                name: ${name}\n                port:\n                  number: 80\n`;
+function helmFor(services: ServiceConfig[], primary: ServiceConfig) {
+  const valuesServices = services
+    .map((service) => {
+      const env = parsePairs(service.envVars);
+      return `  ${slug(service.appName)}:\n    image: ${fullImageFor(service)}\n    replicas: ${service.replicas}\n    port: ${service.port}\n    ingressHost: ${service.ingressHost}\n    resources:\n      cpu: ${service.cpu || initial.cpu}\n      memory: ${service.memory || initial.memory}\n    env:\n${env.map((p) => `      ${p.key}: "${yamlString(p.value)}"`).join("\n") || "      APP_ENV: production"}`;
+    })
+    .join("\n");
 
-  const values = `replicaCount: ${form.replicas}\n\nimage:\n  repository: ${image}\n  pullPolicy: IfNotPresent\n\nservice:\n  port: 80\n  targetPort: ${form.port}\n\ningress:\n  enabled: true\n  host: ${form.ingressHost}\n\nresources:\n  requests:\n    cpu: ${form.cpu}\n    memory: ${form.memory}\n  limits:\n    cpu: ${form.cpu}\n    memory: ${form.memory}\n\nenv:\n${env.map((p) => `  ${p.key}: "${p.value}"`).join("\n") || "  APP_ENV: production"}\n`;
-  const helm = `# Chart.yaml\napiVersion: v2\nname: ${name}\ndescription: Generated Helm chart for ${name}\ntype: application\nversion: 0.1.0\nappVersion: "1.0.0"\n\n# values.yaml\n${values}\n# templates/deployment.yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {{ .Chart.Name }}\nspec:\n  replicas: {{ .Values.replicaCount }}\n  selector:\n    matchLabels:\n      app: {{ .Chart.Name }}\n  template:\n    metadata:\n      labels:\n        app: {{ .Chart.Name }}\n    spec:\n      containers:\n        - name: {{ .Chart.Name }}\n          image: {{ .Values.image.repository | quote }}\n          ports:\n            - containerPort: {{ .Values.service.targetPort }}\n`;
+  return `# Chart.yaml\napiVersion: v2\nname: ${slug(primary.appName)}\ndescription: Generated Helm starter for a ShipConfig service bundle\ntype: application\nversion: 0.1.0\nappVersion: "1.0.0"\n\n# values.yaml\nservices:\n${valuesServices}\n\n# templates/service-bundle.yaml\n# Starter template shape: range over .Values.services to create Deployment, Service, and Ingress per service.\n{{- range $name, $service := .Values.services }}\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {{ $name }}\nspec:\n  replicas: {{ $service.replicas }}\n  selector:\n    matchLabels:\n      app: {{ $name }}\n  template:\n    metadata:\n      labels:\n        app: {{ $name }}\n    spec:\n      containers:\n        - name: {{ $name }}\n          image: {{ $service.image | quote }}\n          ports:\n            - containerPort: {{ $service.port }}\n{{- end }}\n`;
+}
 
-  const actions = `name: Build and Deploy Container\n\non:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\nenv:\n  IMAGE_NAME: ${image}\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      packages: write\n    steps:\n      - uses: actions/checkout@v4\n      - uses: docker/setup-buildx-action@v3\n      - uses: docker/login-action@v3\n        with:\n          registry: ghcr.io\n          username: \${{ github.actor }}\n          password: \${{ secrets.GITHUB_TOKEN }}\n      - uses: docker/build-push-action@v6\n        with:\n          context: .\n          push: true\n          tags: \${{ env.IMAGE_NAME }}:latest\n      - name: Deploy to Kubernetes\n        run: |\n          kubectl apply -f k8s.yaml\n`;
+function scoreReadiness(checks: PreflightCheck[], service: ServiceConfig): ScoreResult {
+  const envCount = parsePairs(service.envVars).length;
+  let score = 100;
+  checks.forEach((check) => {
+    score -= check.severity === "fail" ? 18 : check.severity === "warn" ? 8 : 0;
+  });
+  if (!envCount) {
+    score -= 5;
+  }
+  score = Math.max(0, Math.min(100, score));
+  const recommendations = checks
+    .filter((check) => check.severity !== "pass")
+    .map((check) => check.message)
+    .slice(0, 5);
+  if (!envCount) {
+    recommendations.push("Add explicit environment entries so runtime assumptions are visible.");
+  }
+  return {
+    score,
+    grade: score >= 90 ? "A" : score >= 75 ? "B" : score >= 60 ? "C" : score >= 40 ? "D" : "F",
+    recommendations: recommendations.length ? recommendations : ["No blocking browser-side readiness issues detected."],
+  };
+}
+
+function generateFiles(services: ServiceConfig[], primary: ServiceConfig) {
+  const namespaceDocs = Array.from(new Set(services.map((service) => service.namespace)))
+    .map((namespace) => `apiVersion: v1\nkind: Namespace\nmetadata:\n  name: ${namespace}`)
+    .join("\n---\n");
+  const compose = `services:\n${services.map((service) => composeServiceFor(service, service.id === primary.id)).join("\n\n")}\n`;
+  const kubernetes = `${namespaceDocs}\n---\n${services.map(kubernetesServiceFor).join("\n---\n")}\n`;
+  const actions = `name: Build and Deploy Container Bundle\n\non:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\nenv:\n  PRIMARY_IMAGE: ${fullImageFor(primary)}\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      packages: write\n    steps:\n      - uses: actions/checkout@v4\n      - uses: docker/setup-buildx-action@v3\n      - uses: docker/login-action@v3\n        with:\n          registry: ghcr.io\n          username: \${{ github.actor }}\n          password: \${{ secrets.GITHUB_TOKEN }}\n      - uses: docker/build-push-action@v6\n        with:\n          context: .\n          push: true\n          tags: \${{ env.PRIMARY_IMAGE }}\n      - name: Deploy bundle to Kubernetes\n        run: |\n          kubectl apply -f k8s.yaml\n`;
 
   return {
-    "Dockerfile": dockerfileFor(form.preset, form.port),
+    "Dockerfile": dockerfileFor(primary.preset, primary.port),
     "docker-compose.yml": compose,
     "k8s.yaml": kubernetes,
-    "helm/Chart-and-values.yaml": helm,
+    "helm/Chart-and-values.yaml": helmFor(services, primary),
     ".github/workflows/deploy.yml": actions,
-    "test-deploy.sh": testDeployScriptFor(form),
-    "README.md": readmeFor(form, image),
+    "test-deploy.sh": testDeployScriptFor(services, primary),
+    "README.md": readmeFor(services, primary),
   };
 }
 
 export default function Home() {
-  const [form, setForm] = useState<FormState>(initial);
+  const [services, setServices] = useState<ServiceConfig[]>([initialService]);
+  const [activeServiceId, setActiveServiceId] = useState(initialService.id);
   const [active, setActive] = useState<Tab>("kubernetes");
   const [copied, setCopied] = useState<string>("");
   const [savedLocally, setSavedLocally] = useState(false);
@@ -673,21 +789,36 @@ export default function Home() {
   const [mode, setMode] = useState<Mode>("manual");
   const [resolveTarget, setResolveTarget] = useState<ResolveTarget>("docker");
   const [resolveQuery, setResolveQuery] = useState("");
+  const [theme, setTheme] = useState<Theme>("dark");
+  const [past, setPast] = useState<HistoryState[]>([]);
+  const [future, setFuture] = useState<HistoryState[]>([]);
   const [resolveStatus, setResolveStatus] = useState<ResolveStatus>("idle");
   const [resolveError, setResolveError] = useState("");
   const [suggestion, setSuggestion] = useState<ResolveSuggestion | null>(null);
-  const files = useMemo(() => generateFiles(form), [form]);
+  const form = services.find((service) => service.id === activeServiceId) ?? services[0] ?? initialService;
+  const files = useMemo(() => generateFiles(services, form), [form, services]);
   const preflightChecks = useMemo(() => buildPreflightChecks(form), [form]);
   const preflightSummary = useMemo(() => summarizeChecks(preflightChecks), [preflightChecks]);
+  const readinessScore = useMemo(() => scoreReadiness(preflightChecks, form), [form, preflightChecks]);
+  const groupedChecks = useMemo(
+    () =>
+      (["runtime", "security", "network", "operations"] as PreflightCheck["group"][]).map((group) => ({
+        group,
+        checks: preflightChecks.filter((check) => check.group === group),
+      })),
+    [preflightChecks],
+  );
   const persistedState = useMemo<PersistedState>(
     () => ({
-      version: 1,
-      form,
+      version: 2,
+      services,
+      activeServiceId,
       mode,
       resolveTarget,
       resolveQuery,
+      theme,
     }),
-    [form, mode, resolveQuery, resolveTarget],
+    [activeServiceId, mode, resolveQuery, resolveTarget, services, theme],
   );
   const selected =
     active === "dockerfile"
@@ -704,8 +835,74 @@ export default function Home() {
                 ? "test-deploy.sh"
                 : "README.md";
 
+  function currentHistoryState(): HistoryState {
+    return {
+      services,
+      activeServiceId,
+      mode,
+      resolveTarget,
+      resolveQuery,
+      theme,
+    };
+  }
+
+  function applyHistoryState(snapshot: HistoryState) {
+    setServices(snapshot.services.map((service) => ({ ...service })));
+    setActiveServiceId(snapshot.activeServiceId);
+    setMode(snapshot.mode);
+    setResolveTarget(snapshot.resolveTarget);
+    setResolveQuery(snapshot.resolveQuery);
+    setTheme(snapshot.theme);
+    setSuggestion(null);
+    setResolveStatus("idle");
+    setResolveError("");
+  }
+
+  function commitHistory(next: HistoryState) {
+    setPast((prev) => [...prev.slice(-49), cloneHistoryState(currentHistoryState())]);
+    setFuture([]);
+    applyHistoryState(cloneHistoryState(next));
+  }
+
   function update<K extends keyof FormState>(key: K, value: FormState[K]) {
-    setForm((prev) => ({ ...prev, [key]: value }));
+    commitHistory({
+      ...currentHistoryState(),
+      services: services.map((service) => (service.id === activeServiceId ? { ...service, [key]: value } : service)),
+    });
+  }
+
+  function updateMode(nextMode: Mode) {
+    commitHistory({ ...currentHistoryState(), mode: nextMode });
+  }
+
+  function updateResolveQuery(nextQuery: string) {
+    commitHistory({ ...currentHistoryState(), resolveQuery: nextQuery });
+  }
+
+  function toggleTheme() {
+    commitHistory({ ...currentHistoryState(), theme: theme === "dark" ? "light" : "dark" });
+  }
+
+  function undo() {
+    const previous = past.at(-1);
+    if (!previous) {
+      return;
+    }
+
+    setPast((prev) => prev.slice(0, -1));
+    setFuture((prev) => [cloneHistoryState(currentHistoryState()), ...prev].slice(0, 50));
+    applyHistoryState(cloneHistoryState(previous));
+  }
+
+  function redo() {
+    const next = future[0];
+    if (!next) {
+      return;
+    }
+
+    setFuture((prev) => prev.slice(1));
+    setPast((prev) => [...prev.slice(-49), cloneHistoryState(currentHistoryState())]);
+    applyHistoryState(cloneHistoryState(next));
   }
 
   function currentPersistedState(): PersistedState {
@@ -719,10 +916,12 @@ export default function Home() {
 
     const loadTimer = window.setTimeout(() => {
       if (nextState) {
-        setForm(nextState.form);
+        setServices(nextState.services);
+        setActiveServiceId(nextState.activeServiceId);
         setMode(nextState.mode);
         setResolveTarget(nextState.resolveTarget);
         setResolveQuery(nextState.resolveQuery);
+        setTheme(nextState.theme);
       }
 
       setHasLoadedClientState(true);
@@ -747,14 +946,68 @@ export default function Home() {
   }, [hasLoadedClientState, persistedState]);
 
   function applyPreset(preset: Preset) {
-    setForm((prev) => ({ ...prev, ...presets[preset], preset }));
+    commitHistory({
+      ...currentHistoryState(),
+      services: services.map((service) => (service.id === activeServiceId ? { ...service, ...presets[preset], preset } : service)),
+    });
   }
 
   function selectResolveTarget(target: ResolveTarget) {
-    setResolveTarget(target);
+    commitHistory({ ...currentHistoryState(), resolveTarget: target });
     setSuggestion(null);
     setResolveStatus("idle");
     setResolveError("");
+  }
+
+  function addService() {
+    const id = makeServiceId();
+    const count = services.length + 1;
+    const nextService: ServiceConfig = {
+      ...initial,
+      id,
+      appName: `service-${count}`,
+      image: `service-${count}:latest`,
+      ingressHost: `service-${count}.example.com`,
+    };
+    commitHistory({
+      ...currentHistoryState(),
+      services: [...services, nextService],
+      activeServiceId: id,
+    });
+  }
+
+  function duplicateService() {
+    const id = makeServiceId();
+    const baseName = slug(form.appName);
+    const duplicate: ServiceConfig = {
+      ...form,
+      id,
+      appName: `${baseName}-copy`,
+      image: `${baseName}-copy:latest`,
+      ingressHost: `${baseName}-copy.example.com`,
+    };
+    commitHistory({
+      ...currentHistoryState(),
+      services: [...services, duplicate],
+      activeServiceId: id,
+    });
+  }
+
+  function deleteService(id: string) {
+    if (services.length === 1) {
+      return;
+    }
+
+    const nextServices = services.filter((service) => service.id !== id);
+    commitHistory({
+      ...currentHistoryState(),
+      services: nextServices,
+      activeServiceId: id === activeServiceId ? nextServices[0].id : activeServiceId,
+    });
+  }
+
+  function selectService(id: string) {
+    commitHistory({ ...currentHistoryState(), activeServiceId: id });
   }
 
   async function resolveConfig() {
@@ -792,22 +1045,29 @@ export default function Home() {
   }
 
   function applySuggestion(next: ResolveSuggestion) {
-    setForm((prev) => ({
-      ...prev,
-      preset: next.preset ?? prev.preset,
-      appName: next.appName,
-      image: next.image,
-      registry: next.registry,
-      port: next.port,
-      healthPath: next.healthPath,
-      envVars: next.envVars,
-      secrets: next.secrets,
-      namespace: next.namespace ?? prev.namespace,
-      replicas: next.replicas ?? prev.replicas,
-      cpu: next.cpu ?? prev.cpu,
-      memory: next.memory ?? prev.memory,
-      ingressHost: next.ingressHost ?? `${slug(next.appName)}.example.com`,
-    }));
+    commitHistory({
+      ...currentHistoryState(),
+      services: services.map((service) =>
+        service.id === activeServiceId
+          ? {
+              ...service,
+              preset: next.preset ?? service.preset,
+              appName: next.appName,
+              image: next.image,
+              registry: next.registry,
+              port: next.port,
+              healthPath: next.healthPath,
+              envVars: next.envVars,
+              secrets: next.secrets,
+              namespace: next.namespace ?? service.namespace,
+              replicas: next.replicas ?? service.replicas,
+              cpu: next.cpu ?? service.cpu,
+              memory: next.memory ?? service.memory,
+              ingressHost: next.ingressHost ?? `${slug(next.appName)}.example.com`,
+            }
+          : service,
+      ),
+    });
   }
 
   async function copy(text: string, label: string) {
@@ -839,7 +1099,10 @@ export default function Home() {
     }
 
     if (label === "Resources") {
-      setForm((prev) => ({ ...prev, cpu: initial.cpu, memory: initial.memory }));
+      commitHistory({
+        ...currentHistoryState(),
+        services: services.map((service) => (service.id === activeServiceId ? { ...service, cpu: initial.cpu, memory: initial.memory } : service)),
+      });
       return;
     }
 
@@ -866,7 +1129,7 @@ export default function Home() {
   }
 
   return (
-    <main className="min-h-screen bg-[#080b10] text-slate-100">
+    <main className={`min-h-screen bg-[#080b10] text-slate-100 theme-${theme}`}>
       <div className="flex min-h-screen flex-col">
         <header className="sticky top-0 z-20 border-b border-slate-800/90 bg-[#090d13]/95 backdrop-blur">
           <div className="mx-auto flex max-w-[1540px] items-center justify-between gap-3 px-4 py-3 sm:px-5 lg:px-6">
@@ -894,6 +1157,32 @@ export default function Home() {
                 {preflightSummary.pass} pass / {preflightSummary.warn} warn / {preflightSummary.fail} fail
               </div>
               <button
+                type="button"
+                onClick={undo}
+                disabled={!past.length}
+                title="Undo"
+                className="inline-flex size-9 items-center justify-center rounded-lg border border-slate-700 bg-slate-900 text-slate-300 transition hover:border-slate-600 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Undo2 className="size-4" />
+              </button>
+              <button
+                type="button"
+                onClick={redo}
+                disabled={!future.length}
+                title="Redo"
+                className="inline-flex size-9 items-center justify-center rounded-lg border border-slate-700 bg-slate-900 text-slate-300 transition hover:border-slate-600 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Redo2 className="size-4" />
+              </button>
+              <button
+                type="button"
+                onClick={toggleTheme}
+                title="Toggle theme"
+                className="inline-flex size-9 items-center justify-center rounded-lg border border-slate-700 bg-slate-900 text-slate-300 transition hover:border-slate-600 hover:bg-slate-800"
+              >
+                {theme === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
+              </button>
+              <button
                 onClick={shareConfig}
                 className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-3 text-sm font-medium text-slate-200 transition hover:border-slate-600 hover:bg-slate-800"
               >
@@ -912,7 +1201,79 @@ export default function Home() {
           </div>
         </header>
 
-        <section className="mx-auto grid w-full max-w-[1540px] flex-1 gap-4 px-4 py-4 sm:px-5 lg:grid-cols-[360px_minmax(0,1fr)] lg:px-6">
+        <section className="mx-auto grid w-full max-w-[1740px] flex-1 gap-4 px-4 py-4 sm:px-5 lg:grid-cols-[260px_minmax(360px,430px)_minmax(0,1fr)] lg:px-6">
+          <aside className="rounded-xl border border-slate-800 bg-[#0c1118] shadow-[0_1px_0_rgba(255,255,255,0.03)_inset] lg:max-h-[calc(100vh-96px)] lg:overflow-auto">
+            <div className="border-b border-slate-800 px-4 py-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold text-slate-200">Workspace</div>
+                  <div className="mt-0.5 text-xs text-slate-500">{services.length} service{services.length === 1 ? "" : "s"} in bundle</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={addService}
+                  title="Add service"
+                  className="inline-flex size-8 items-center justify-center rounded-md border border-sky-400/30 bg-sky-400/15 text-sky-100 transition hover:border-sky-300/50 hover:bg-sky-400/20"
+                >
+                  <Plus className="size-4" />
+                </button>
+              </div>
+            </div>
+            <div className="grid gap-2 p-3">
+              {services.map((service, index) => {
+                const isSelected = service.id === activeServiceId;
+                const checks = buildPreflightChecks(service);
+                const summary = summarizeChecks(checks);
+                return (
+                  <button
+                    key={service.id}
+                    type="button"
+                    onClick={() => selectService(service.id)}
+                    className={`rounded-lg border px-3 py-2.5 text-left transition ${
+                      isSelected
+                        ? "border-sky-400/45 bg-sky-400/10 text-sky-100"
+                        : "border-slate-800 bg-[#090d13] text-slate-300 hover:border-slate-700 hover:bg-slate-900"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-medium">{slug(service.appName)}</div>
+                        <div className="mt-1 truncate font-mono text-[11px] text-slate-500">{fullImageFor(service)}</div>
+                      </div>
+                      <span className="rounded border border-slate-700 px-1.5 py-0.5 font-mono text-[10px] text-slate-400">S{index + 1}</span>
+                    </div>
+                    <div className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-500">
+                      <span>{service.port}</span>
+                      <span>/</span>
+                      <span>{service.replicas} replicas</span>
+                      <span className={summary.fail ? "text-rose-300" : summary.warn ? "text-amber-300" : "text-emerald-300"}>
+                        {summary.fail ? "fail" : summary.warn ? "warn" : "pass"}
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="grid grid-cols-2 gap-2 border-t border-slate-800 p-3">
+              <button
+                type="button"
+                onClick={duplicateService}
+                className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-slate-700 bg-slate-900 px-2 text-xs font-medium text-slate-200 transition hover:border-slate-600 hover:bg-slate-800"
+              >
+                <Copy className="size-3.5" />
+                Duplicate
+              </button>
+              <button
+                type="button"
+                onClick={() => deleteService(activeServiceId)}
+                disabled={services.length === 1}
+                className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-slate-700 bg-slate-900 px-2 text-xs font-medium text-slate-200 transition hover:border-rose-400/40 hover:bg-rose-500/10 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Trash2 className="size-3.5" />
+                Delete
+              </button>
+            </div>
+          </aside>
           <aside className="rounded-xl border border-slate-800 bg-[#0c1118] shadow-[0_1px_0_rgba(255,255,255,0.03)_inset] lg:max-h-[calc(100vh-96px)] lg:overflow-auto">
             <div className="border-b border-slate-800 px-4 py-3">
               <div className="flex flex-col gap-3">
@@ -927,7 +1288,7 @@ export default function Home() {
                   ].map(([id, label]) => (
                     <button
                       key={id}
-                      onClick={() => setMode(id as Mode)}
+                      onClick={() => updateMode(id as Mode)}
                       className={`h-8 rounded-md px-2 text-xs font-medium transition ${
                         mode === id
                           ? "bg-slate-800 text-sky-100"
@@ -978,7 +1339,7 @@ export default function Home() {
                     <div className="grid gap-2 min-[390px]:grid-cols-[minmax(0,1fr)_auto]">
                       <input
                         value={resolveQuery}
-                        onChange={(e) => setResolveQuery(e.target.value)}
+                        onChange={(e) => updateResolveQuery(e.target.value)}
                         onKeyDown={(e) => {
                           if (e.key === "Enter") {
                             void resolveConfig();
@@ -1277,6 +1638,72 @@ export default function Home() {
                 <span className="truncate font-mono">{selected}</span>
               </div>
               <div className="font-mono text-xs text-slate-600">{files[selected].split("\n").length} lines</div>
+            </div>
+            <div className="grid gap-3 border-b border-slate-800 bg-[#090d13]/55 p-3 xl:grid-cols-[220px_minmax(0,1fr)]">
+              <section className="rounded-lg border border-slate-800 bg-[#070a0f] p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-medium uppercase tracking-wide text-slate-500">Readiness score</div>
+                    <div className="mt-1 text-3xl font-semibold text-slate-100">{readinessScore.score}</div>
+                  </div>
+                  <div className={`flex size-12 items-center justify-center rounded-lg border text-lg font-semibold ${
+                    readinessScore.score >= 90
+                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+                      : readinessScore.score >= 75
+                        ? "border-sky-500/30 bg-sky-500/10 text-sky-200"
+                        : readinessScore.score >= 60
+                          ? "border-amber-500/30 bg-amber-500/10 text-amber-200"
+                          : "border-rose-500/30 bg-rose-500/10 text-rose-200"
+                  }`}>
+                    {readinessScore.grade}
+                  </div>
+                </div>
+                <div className="mt-2 text-xs leading-5 text-slate-500">
+                  Active service: <span className="font-mono text-slate-300">{slug(form.appName)}</span>
+                </div>
+              </section>
+              <section className="grid gap-2 rounded-lg border border-slate-800 bg-[#070a0f] p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-xs font-medium uppercase tracking-wide text-slate-500">Browser validation</div>
+                  <div className="flex shrink-0 items-center gap-1.5 font-mono text-[11px]">
+                    <span className="rounded-md border border-emerald-500/20 bg-emerald-500/10 px-1.5 py-0.5 text-emerald-200">{preflightSummary.pass} pass</span>
+                    <span className="rounded-md border border-amber-500/20 bg-amber-500/10 px-1.5 py-0.5 text-amber-200">{preflightSummary.warn} warn</span>
+                    <span className="rounded-md border border-rose-500/20 bg-rose-500/10 px-1.5 py-0.5 text-rose-200">{preflightSummary.fail} fail</span>
+                  </div>
+                </div>
+                <div className="grid gap-2 xl:grid-cols-2">
+                  {groupedChecks.map(({ group, checks }) => (
+                    <div key={group} className="rounded-md border border-slate-800 bg-[#090d13] p-2">
+                      <div className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-slate-500">{group}</div>
+                      <div className="grid gap-1.5">
+                        {checks.map((check) => (
+                          <div key={check.label} className="grid grid-cols-[auto_minmax(0,1fr)_auto] gap-2 text-xs leading-4">
+                            <span className={`mt-1 size-2 rounded-full ${check.severity === "pass" ? "bg-emerald-400" : check.severity === "warn" ? "bg-amber-300" : "bg-rose-400"}`} />
+                            <div className="min-w-0">
+                              <div className="font-medium text-slate-300">{check.label}</div>
+                              <div className="text-slate-500">{check.message}</div>
+                            </div>
+                            {check.severity !== "pass" && canFixPreflight(check.label) ? (
+                              <button
+                                type="button"
+                                onClick={() => fixPreflight(check.label)}
+                                className="self-start rounded-md border border-slate-700 bg-slate-900 px-2 py-0.5 text-[11px] font-medium text-slate-300 transition hover:border-sky-400/40 hover:bg-slate-800 hover:text-sky-100"
+                              >
+                                Fix
+                              </button>
+                            ) : null}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="border-t border-slate-800 pt-2 text-xs leading-5 text-slate-500">
+                  {readinessScore.recommendations.slice(0, 2).map((recommendation) => (
+                    <div key={recommendation}>{recommendation}</div>
+                  ))}
+                </div>
+              </section>
             </div>
             <pre className="max-h-[calc(100vh-169px)] min-h-[520px] overflow-auto bg-[#070a0f] p-4 font-mono text-sm leading-6 text-slate-200 sm:p-5"><code>{files[selected]}</code></pre>
           </section>

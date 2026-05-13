@@ -7,3 +7,48 @@ body { margin: 0; background: #020617; }
 ::selection { background: rgba(103,232,249,.35); }
 pre::-webkit-scrollbar, textarea::-webkit-scrollbar { width: 10px; height: 10px; }
 pre::-webkit-scrollbar-thumb, textarea::-webkit-scrollbar-thumb { background: rgba(148,163,184,.35); border-radius: 999px; }
+
+.theme-light {
+  color-scheme: light;
+  background: #f7fafc;
+  color: #0f172a;
+}
+
+.theme-light .bg-\[\#080b10\],
+.theme-light .bg-\[\#090d13\],
+.theme-light .bg-\[\#090d13\]\/55,
+.theme-light .bg-\[\#090d13\]\/45,
+.theme-light .bg-\[\#0a0f15\],
+.theme-light .bg-\[\#0c1118\],
+.theme-light .bg-\[\#070a0f\],
+.theme-light .bg-slate-900,
+.theme-light .bg-slate-900\/70 {
+  background-color: #ffffff !important;
+}
+
+.theme-light .border-slate-800,
+.theme-light .border-slate-800\/80,
+.theme-light .border-slate-800\/90,
+.theme-light .border-slate-700,
+.theme-light .border-slate-700\/80 {
+  border-color: #d8e0ea !important;
+}
+
+.theme-light .text-slate-100,
+.theme-light .text-slate-200,
+.theme-light .text-slate-300 {
+  color: #102033 !important;
+}
+
+.theme-light .text-slate-400,
+.theme-light .text-slate-500,
+.theme-light .text-slate-600 {
+  color: #53657a !important;
+}
+
+.theme-light input,
+.theme-light textarea,
+.theme-light pre {
+  background: #f8fafc !important;
+  color: #0f172a !important;
+}
