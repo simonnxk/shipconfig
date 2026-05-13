@@ -19,10 +19,11 @@ import {
 import { useMemo, useState } from "react";
 
 type Preset = "node" | "python" | "go" | "static";
-type Tab = "dockerfile" | "compose" | "kubernetes" | "helm" | "actions";
+type Tab = "dockerfile" | "compose" | "kubernetes" | "helm" | "actions" | "testDeploy";
 type Mode = "manual" | "auto";
 type ResolveStatus = "idle" | "loading" | "success" | "error";
 type ResolveTarget = "docker" | "kubernetes";
+type CheckSeverity = "pass" | "warn" | "fail";
 
 type FormState = {
   preset: Preset;
@@ -64,6 +65,14 @@ type ResolveResponse = {
   query: string;
   suggestion: ResolveSuggestion;
 };
+
+type PreflightCheck = {
+  label: string;
+  message: string;
+  severity: CheckSeverity;
+};
+
+type PreflightSummary = Record<CheckSeverity, number>;
 
 const presets: Record<Preset, Partial<FormState> & { label: string; description: string }> = {
   node: {
@@ -126,6 +135,7 @@ const tabs: { id: Tab; label: string }[] = [
   { id: "kubernetes", label: "k8s.yaml" },
   { id: "helm", label: "helm/" },
   { id: "actions", label: ".github/workflows/deploy.yml" },
+  { id: "testDeploy", label: "test-deploy.sh" },
 ];
 
 function slug(value: string) {
@@ -144,6 +154,91 @@ function parsePairs(value: string) {
     .filter((pair) => pair.key);
 }
 
+function hasLatestTag(image: string) {
+  const clean = image.trim();
+  if (!clean || clean.endsWith(":latest")) {
+    return true;
+  }
+
+  const lastSegment = clean.split("/").at(-1) ?? "";
+  return !lastSegment.includes(":");
+}
+
+function isStatefulNonHttpWorkload(form: FormState) {
+  const fingerprint = `${form.appName} ${form.image}`.toLowerCase();
+  return fingerprint.includes("redis") || fingerprint.includes("postgres") || fingerprint.includes("postgresql") || form.port === 6379 || form.port === 5432;
+}
+
+function buildPreflightChecks(form: FormState): PreflightCheck[] {
+  const requiredFields = [
+    form.appName.trim(),
+    form.image.trim(),
+    form.registry.trim(),
+    form.namespace.trim(),
+    form.healthPath.trim(),
+  ];
+  const secrets = parsePairs(form.secrets);
+  const hasSecretPlaceholders = secrets.some((pair) => /change-me|changeme|replace-me|todo/i.test(pair.value));
+  const hasResources = Boolean(form.cpu.trim() && form.memory.trim());
+  const ingressHost = form.ingressHost.trim();
+  const replicasSane = Number.isFinite(form.replicas) && form.replicas >= 1 && form.replicas <= 10;
+  const portSane = Number.isFinite(form.port) && form.port > 0 && form.port <= 65535;
+  const healthPathLooksHttp = form.healthPath.trim().startsWith("/");
+
+  return [
+    {
+      label: "Required fields",
+      severity: requiredFields.every(Boolean) && portSane ? "pass" : "fail",
+      message: requiredFields.every(Boolean) && portSane ? "Core runtime fields are present." : "App, image, registry, namespace, health path, and a valid port are required.",
+    },
+    {
+      label: "Secret placeholders",
+      severity: hasSecretPlaceholders ? "warn" : "pass",
+      message: hasSecretPlaceholders ? "One or more secrets still use change-me style placeholders." : "No obvious placeholder secrets detected.",
+    },
+    {
+      label: "HTTP probes",
+      severity: isStatefulNonHttpWorkload(form) && healthPathLooksHttp ? "warn" : healthPathLooksHttp ? "pass" : "fail",
+      message:
+        isStatefulNonHttpWorkload(form) && healthPathLooksHttp
+          ? "Redis/Postgres-style workloads usually need TCP or command probes instead of HTTP probes."
+          : healthPathLooksHttp
+            ? "Health path is shaped like an HTTP endpoint."
+            : "Health path should start with / for the generated HTTP probes.",
+    },
+    {
+      label: "Image tag",
+      severity: hasLatestTag(form.image) ? "warn" : "pass",
+      message: hasLatestTag(form.image) ? "Pin an immutable image tag before production deployment." : "Image tag is pinned.",
+    },
+    {
+      label: "Resources",
+      severity: hasResources ? "pass" : "warn",
+      message: hasResources ? "CPU and memory requests/limits are present." : "CPU and memory values should be set for Kubernetes.",
+    },
+    {
+      label: "Ingress domain",
+      severity: ingressHost.includes(".") ? "pass" : "warn",
+      message: ingressHost.includes(".") ? "Ingress host looks like a DNS name." : "Ingress host should be a real domain before exposing traffic.",
+    },
+    {
+      label: "Replicas",
+      severity: replicasSane ? "pass" : "warn",
+      message: replicasSane ? "Replica count is in a normal smoke-test range." : "Use at least 1 replica and review high counts before testing.",
+    },
+  ];
+}
+
+function summarizeChecks(checks: PreflightCheck[]): PreflightSummary {
+  return checks.reduce<PreflightSummary>(
+    (summary, check) => {
+      summary[check.severity] += 1;
+      return summary;
+    },
+    { pass: 0, warn: 0, fail: 0 },
+  );
+}
+
 function dockerfileFor(preset: Preset, port: number) {
   if (preset === "python") {
     return `FROM python:3.12-slim AS runtime\nWORKDIR /app\nENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1\nCOPY requirements.txt ./\nRUN pip install --no-cache-dir -r requirements.txt\nCOPY . .\nEXPOSE ${port}\nCMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "${port}"]\n`;
@@ -155,6 +250,60 @@ function dockerfileFor(preset: Preset, port: number) {
     return `FROM node:22-alpine AS build\nWORKDIR /app\nCOPY package*.json ./\nRUN npm ci\nCOPY . .\nRUN npm run build\n\nFROM nginx:1.27-alpine\nCOPY --from=build /app/dist /usr/share/nginx/html\nEXPOSE ${port}\nCMD ["nginx", "-g", "daemon off;"]\n`;
   }
   return `FROM node:22-alpine AS deps\nWORKDIR /app\nCOPY package*.json ./\nRUN npm ci --omit=dev\n\nFROM node:22-alpine AS runtime\nWORKDIR /app\nENV NODE_ENV=production\nCOPY --from=deps /app/node_modules ./node_modules\nCOPY . .\nEXPOSE ${port}\nCMD ["npm", "start"]\n`;
+}
+
+function testDeployScriptFor(form: FormState) {
+  const name = slug(form.appName);
+  const smokeNamespace = `shipconfig-smoke-${name}`;
+  const healthPath = form.healthPath.startsWith("/") ? form.healthPath : `/${form.healthPath}`;
+
+  return `#!/usr/bin/env bash
+set -euo pipefail
+
+# ShipConfig no-side-effect validation plan for ${name}.
+# Run this from the directory containing Dockerfile, docker-compose.yml, and k8s.yaml.
+# The default commands validate syntax and perform Kubernetes dry-runs only.
+# Smoke commands use a temporary namespace (${smokeNamespace}) and are opt-in.
+
+APP_NAME="${name}"
+SMOKE_NAMESPACE="${smokeNamespace}"
+APP_PORT="${form.port}"
+HEALTH_PATH="${healthPath}"
+
+echo "== Docker Compose validation =="
+docker compose -f docker-compose.yml config --quiet
+docker compose -f docker-compose.yml config
+
+echo "== Kubernetes client-side dry-run =="
+kubectl apply --dry-run=client -f k8s.yaml
+
+echo "== Kubernetes server-side dry-run =="
+kubectl create namespace "$SMOKE_NAMESPACE" --dry-run=client -o yaml | kubectl apply --dry-run=server -f -
+sed "s/namespace: ${form.namespace}/namespace: $SMOKE_NAMESPACE/g; s/name: ${form.namespace}/name: $SMOKE_NAMESPACE/g" k8s.yaml | kubectl apply --dry-run=server -f -
+
+cat <<NEXT_STEPS
+
+Optional local cluster smoke test:
+  kind create cluster --name shipconfig-smoke
+  # or start minikube:
+  # minikube start
+
+  kubectl create namespace "$SMOKE_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+  sed "s/namespace: ${form.namespace}/namespace: $SMOKE_NAMESPACE/g; s/name: ${form.namespace}/name: $SMOKE_NAMESPACE/g" k8s.yaml | kubectl apply -f -
+  kubectl -n "$SMOKE_NAMESPACE" rollout status "deployment/$APP_NAME" --timeout=120s
+  kubectl -n "$SMOKE_NAMESPACE" port-forward "svc/$APP_NAME" "8080:80"
+  curl -fsS "http://127.0.0.1:8080$HEALTH_PATH"
+
+Cleanup:
+  kubectl delete namespace "$SMOKE_NAMESPACE" --ignore-not-found
+  kind delete cluster --name shipconfig-smoke
+
+Notes:
+  - This script intentionally does not apply to the configured namespace by default.
+  - Server dry-run requires access to a Kubernetes API server.
+  - Review Secret placeholders and HTTP probes before using any real environment.
+NEXT_STEPS
+`;
 }
 
 function generateFiles(form: FormState) {
@@ -183,6 +332,7 @@ function generateFiles(form: FormState) {
     "k8s.yaml": kubernetes,
     "helm/Chart-and-values.yaml": helm,
     ".github/workflows/deploy.yml": actions,
+    "test-deploy.sh": testDeployScriptFor(form),
   };
 }
 
@@ -197,8 +347,20 @@ export default function Home() {
   const [resolveError, setResolveError] = useState("");
   const [suggestion, setSuggestion] = useState<ResolveSuggestion | null>(null);
   const files = useMemo(() => generateFiles(form), [form]);
-  const selected = active === "dockerfile" ? "Dockerfile" : active === "compose" ? "docker-compose.yml" : active === "kubernetes" ? "k8s.yaml" : active === "helm" ? "helm/Chart-and-values.yaml" : ".github/workflows/deploy.yml";
-  const validation = [!form.appName && "App name is required", !form.image && "Image is required", form.port <= 0 && "Port must be positive", !form.ingressHost.includes(".") && "Ingress host should be a domain"].filter(Boolean);
+  const preflightChecks = useMemo(() => buildPreflightChecks(form), [form]);
+  const preflightSummary = useMemo(() => summarizeChecks(preflightChecks), [preflightChecks]);
+  const selected =
+    active === "dockerfile"
+      ? "Dockerfile"
+      : active === "compose"
+        ? "docker-compose.yml"
+        : active === "kubernetes"
+          ? "k8s.yaml"
+          : active === "helm"
+            ? "helm/Chart-and-values.yaml"
+            : active === "actions"
+              ? ".github/workflows/deploy.yml"
+              : "test-deploy.sh";
 
   function update<K extends keyof FormState>(key: K, value: FormState[K]) {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -299,9 +461,9 @@ export default function Home() {
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <div className={`hidden items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs md:flex ${validation.length ? "border-amber-500/30 bg-amber-500/10 text-amber-200" : "border-emerald-500/25 bg-emerald-500/10 text-emerald-200"}`}>
-                {validation.length ? <AlertTriangle className="size-3.5" /> : <CheckCircle2 className="size-3.5" />}
-                {validation.length ? `${validation.length} issue${validation.length > 1 ? "s" : ""}` : "Valid"}
+              <div className={`hidden items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs md:flex ${preflightSummary.fail ? "border-rose-500/30 bg-rose-500/10 text-rose-100" : preflightSummary.warn ? "border-amber-500/30 bg-amber-500/10 text-amber-200" : "border-emerald-500/25 bg-emerald-500/10 text-emerald-200"}`}>
+                {preflightSummary.fail || preflightSummary.warn ? <AlertTriangle className="size-3.5" /> : <CheckCircle2 className="size-3.5" />}
+                {preflightSummary.pass} pass / {preflightSummary.warn} warn / {preflightSummary.fail} fail
               </div>
               <button
                 onClick={downloadZip}
@@ -558,19 +720,40 @@ export default function Home() {
                 </label>
               </section>
 
-              <div className={`rounded-lg border px-3 py-2.5 text-xs leading-5 ${validation.length ? "border-amber-500/30 bg-amber-500/10 text-amber-100" : "border-emerald-500/25 bg-emerald-500/10 text-emerald-100"}`}>
-                <div className="mb-1 flex items-center gap-2 font-medium">
-                  {validation.length ? <AlertTriangle className="size-3.5" /> : <CheckCircle2 className="size-3.5" />}
-                  Validation
+              <section className="rounded-lg border border-slate-800 bg-[#090d13] p-3">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+                    {preflightSummary.fail || preflightSummary.warn ? <AlertTriangle className="size-3.5 text-amber-300" /> : <CheckCircle2 className="size-3.5 text-emerald-300" />}
+                    Preflight checks
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1.5 font-mono text-[11px]">
+                    <span className="rounded-md border border-emerald-500/20 bg-emerald-500/10 px-1.5 py-0.5 text-emerald-200">{preflightSummary.pass} pass</span>
+                    <span className="rounded-md border border-amber-500/20 bg-amber-500/10 px-1.5 py-0.5 text-amber-200">{preflightSummary.warn} warn</span>
+                    <span className="rounded-md border border-rose-500/20 bg-rose-500/10 px-1.5 py-0.5 text-rose-200">{preflightSummary.fail} fail</span>
+                  </div>
                 </div>
-                {validation.length ? validation.join(" | ") : "Configuration is ready to export."}
-              </div>
+                <div className="grid gap-2">
+                  {preflightChecks.map((check) => (
+                    <div key={check.label} className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-xs leading-5">
+                      <span
+                        className={`mt-1 size-2 rounded-full ${
+                          check.severity === "pass" ? "bg-emerald-400" : check.severity === "warn" ? "bg-amber-300" : "bg-rose-400"
+                        }`}
+                      />
+                      <div className="min-w-0">
+                        <div className="font-medium text-slate-300">{check.label}</div>
+                        <div className="text-slate-500">{check.message}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
             </div>
           </aside>
 
           <section className="min-w-0 overflow-hidden rounded-xl border border-slate-800 bg-[#0c1118] shadow-[0_1px_0_rgba(255,255,255,0.03)_inset]">
             <div className="flex min-h-12 flex-col gap-2 border-b border-slate-800 bg-[#0a0f15] px-3 py-2 xl:flex-row xl:items-center">
-              <div className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto">
+              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
                 {tabs.map((tab) => (
                   <button
                     key={tab.id}
