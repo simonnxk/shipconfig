@@ -534,6 +534,27 @@ function runtimeDefaultsFor(preset: Preset | undefined) {
   };
 }
 
+function runtimeBaseSuggestion(query: string): ResolveSuggestion {
+  const normalizedQuery = normalizeKey(query);
+  const preset = inferPreset(normalizedQuery) ?? "node";
+  const appName = slug(normalizedQuery);
+  const defaults = runtimeDefaultsFor(preset);
+
+  return {
+    appName,
+    image: `${appName}:latest`,
+    registry: "ghcr.io/acme",
+    port: defaults.port,
+    healthPath: defaults.healthPath,
+    envVars: defaults.envVars,
+    secrets: defaults.secrets,
+    source: "local runtime inference",
+    confidence: 0.7,
+    description: `Local ${preset} runtime defaults inferred from the request without external registry lookup.`,
+    preset,
+  };
+}
+
 function withRuntimeDefaults(suggestion: ResolveSuggestion, query: string): ResolveSuggestion {
   const normalizedQuery = normalizeKey(query);
   const normalizedName = normalizeKey(suggestion.appName);
@@ -591,6 +612,10 @@ function resolveTargetFromHint(hint: ResolveHint, query: string): ResolveTarget 
   return hint;
 }
 
+function shouldUseLocalRuntimeBase(hint: ResolveHint, resolveTarget: ResolveTarget) {
+  return hint === "app-description" || (hint === "auto" && resolveTarget === "runtime");
+}
+
 export async function POST(request: Request) {
   let body: ResolveRequest;
 
@@ -613,8 +638,11 @@ export async function POST(request: Request) {
 
   const resolveTarget = resolveTargetFromHint(target as ResolveHint, query);
   const key = normalizeKey(query);
-  const dockerSuggestion = curated[key] ?? curated[slug(key)] ?? (await resolveFromDockerHub(query));
-  const suggestion = applyTargetDefaults(resolveTarget, dockerSuggestion, query);
+  const baseSuggestion =
+    curated[key] ??
+    curated[slug(key)] ??
+    (shouldUseLocalRuntimeBase(target as ResolveHint, resolveTarget) ? runtimeBaseSuggestion(query) : await resolveFromDockerHub(query));
+  const suggestion = applyTargetDefaults(resolveTarget, baseSuggestion, query);
 
   return NextResponse.json({
     target: resolveTarget,
