@@ -9,14 +9,19 @@ import {
   FileCode2,
   GitBranch,
   Layers3,
+  Loader2,
+  Search,
   Server,
   Settings2,
   TerminalSquare,
+  Wand2,
 } from "lucide-react";
 import { useMemo, useState } from "react";
 
 type Preset = "node" | "python" | "go" | "static";
 type Tab = "dockerfile" | "compose" | "kubernetes" | "helm" | "actions";
+type Mode = "manual" | "auto";
+type ResolveStatus = "idle" | "loading" | "success" | "error";
 
 type FormState = {
   preset: Preset;
@@ -32,6 +37,26 @@ type FormState = {
   secrets: string;
   cpu: string;
   memory: string;
+};
+
+type ResolveSuggestion = {
+  appName: string;
+  image: string;
+  registry: string;
+  port: number;
+  healthPath: string;
+  envVars: string;
+  secrets: string;
+  source: string;
+  confidence: number;
+  description: string;
+  preset?: Preset;
+};
+
+type ResolveResponse = {
+  target: "docker";
+  query: string;
+  suggestion: ResolveSuggestion;
 };
 
 const presets: Record<Preset, Partial<FormState> & { label: string; description: string }> = {
@@ -159,6 +184,11 @@ export default function Home() {
   const [form, setForm] = useState<FormState>(initial);
   const [active, setActive] = useState<Tab>("kubernetes");
   const [copied, setCopied] = useState<string>("");
+  const [mode, setMode] = useState<Mode>("manual");
+  const [resolveQuery, setResolveQuery] = useState("");
+  const [resolveStatus, setResolveStatus] = useState<ResolveStatus>("idle");
+  const [resolveError, setResolveError] = useState("");
+  const [suggestion, setSuggestion] = useState<ResolveSuggestion | null>(null);
   const files = useMemo(() => generateFiles(form), [form]);
   const selected = active === "dockerfile" ? "Dockerfile" : active === "compose" ? "docker-compose.yml" : active === "kubernetes" ? "k8s.yaml" : active === "helm" ? "helm/Chart-and-values.yaml" : ".github/workflows/deploy.yml";
   const validation = [!form.appName && "App name is required", !form.image && "Image is required", form.port <= 0 && "Port must be positive", !form.ingressHost.includes(".") && "Ingress host should be a domain"].filter(Boolean);
@@ -169,6 +199,55 @@ export default function Home() {
 
   function applyPreset(preset: Preset) {
     setForm((prev) => ({ ...prev, ...presets[preset], preset }));
+  }
+
+  async function resolveConfig() {
+    const query = resolveQuery.trim();
+    if (!query) {
+      setResolveStatus("error");
+      setResolveError("Enter an image or app query.");
+      setSuggestion(null);
+      return;
+    }
+
+    setResolveStatus("loading");
+    setResolveError("");
+    setSuggestion(null);
+
+    try {
+      const response = await fetch("/api/resolve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target: "docker", query }),
+      });
+      const data = (await response.json()) as ResolveResponse | { error?: string };
+
+      if (!response.ok || !("suggestion" in data)) {
+        const message = "error" in data ? data.error : "";
+        throw new Error(message || "Unable to resolve image metadata.");
+      }
+
+      setSuggestion(data.suggestion);
+      setResolveStatus("success");
+    } catch (error) {
+      setResolveError(error instanceof Error ? error.message : "Unable to resolve image metadata.");
+      setResolveStatus("error");
+    }
+  }
+
+  function applySuggestion(next: ResolveSuggestion) {
+    setForm((prev) => ({
+      ...prev,
+      preset: next.preset ?? prev.preset,
+      appName: next.appName,
+      image: next.image,
+      registry: next.registry,
+      port: next.port,
+      healthPath: next.healthPath,
+      envVars: next.envVars,
+      secrets: next.secrets,
+      ingressHost: `${slug(next.appName)}.example.com`,
+    }));
   }
 
   async function copy(text: string, label: string) {
@@ -228,13 +307,126 @@ export default function Home() {
         <section className="mx-auto grid w-full max-w-[1540px] flex-1 gap-4 px-4 py-4 sm:px-5 lg:grid-cols-[360px_minmax(0,1fr)] lg:px-6">
           <aside className="rounded-xl border border-slate-800 bg-[#0c1118] shadow-[0_1px_0_rgba(255,255,255,0.03)_inset] lg:max-h-[calc(100vh-96px)] lg:overflow-auto">
             <div className="border-b border-slate-800 px-4 py-3">
-              <div className="flex items-center gap-2 text-sm font-semibold text-slate-200">
-                <Settings2 className="size-4 text-sky-300" />
-                Settings
+              <div className="flex flex-col gap-3">
+                <div className="flex items-center gap-2 text-sm font-semibold text-slate-200">
+                  <Settings2 className="size-4 text-sky-300" />
+                  Settings
+                </div>
+                <div className="grid grid-cols-2 gap-1 rounded-lg border border-slate-800 bg-[#070a0f] p-1">
+                  {[
+                    ["manual", "Manual Config"],
+                    ["auto", "Auto Resolve"],
+                  ].map(([id, label]) => (
+                    <button
+                      key={id}
+                      onClick={() => setMode(id as Mode)}
+                      className={`h-8 rounded-md px-2 text-xs font-medium transition ${
+                        mode === id
+                          ? "bg-slate-800 text-sky-100"
+                          : "text-slate-500 hover:bg-slate-900 hover:text-slate-300"
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
 
             <div className="space-y-5 p-4">
+              {mode === "auto" ? (
+                <section className="grid gap-3">
+                  <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+                    <Wand2 className="size-3.5" />
+                    Auto Resolve
+                  </div>
+                  <label className="grid gap-1.5 text-xs font-medium text-slate-400">
+                    Target/source type
+                    <select
+                      value="docker"
+                      disabled
+                      className="h-9 w-full rounded-lg border border-slate-800 bg-[#070a0f] px-3 text-sm font-normal text-slate-100 outline-none"
+                    >
+                      <option value="docker">Docker image</option>
+                    </select>
+                  </label>
+                  <label className="grid gap-1.5 text-xs font-medium text-slate-400">
+                    App or image query
+                    <div className="flex gap-2">
+                      <input
+                        value={resolveQuery}
+                        onChange={(e) => setResolveQuery(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            void resolveConfig();
+                          }
+                        }}
+                        placeholder="litellm"
+                        className="h-9 min-w-0 flex-1 rounded-lg border border-slate-800 bg-[#070a0f] px-3 text-sm font-normal text-slate-100 outline-none transition placeholder:text-slate-600 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                      />
+                      <button
+                        onClick={resolveConfig}
+                        disabled={resolveStatus === "loading"}
+                        className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-sky-400/30 bg-sky-400/15 px-3 text-sm font-medium text-sky-100 transition hover:border-sky-300/50 hover:bg-sky-400/20 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {resolveStatus === "loading" ? <Loader2 className="size-4 animate-spin" /> : <Search className="size-4" />}
+                        Resolve
+                      </button>
+                    </div>
+                  </label>
+                  <p className="text-xs leading-5 text-slate-500">
+                    Auto Resolve uses public image metadata plus curated templates; verify before production.
+                  </p>
+
+                  {resolveStatus === "loading" ? (
+                    <div className="rounded-lg border border-slate-800 bg-[#090d13] px-3 py-2.5 text-xs text-slate-400">
+                      Resolving image metadata and template hints...
+                    </div>
+                  ) : null}
+
+                  {resolveStatus === "error" ? (
+                    <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2.5 text-xs leading-5 text-rose-100">
+                      {resolveError}
+                    </div>
+                  ) : null}
+
+                  {suggestion ? (
+                    <div className="rounded-lg border border-slate-800 bg-[#090d13] p-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="truncate text-sm font-semibold text-slate-100">{suggestion.appName}</div>
+                          <div className="mt-1 truncate font-mono text-xs text-slate-500">
+                            {suggestion.registry}/{suggestion.image}
+                          </div>
+                        </div>
+                        <div className="rounded-md border border-emerald-500/25 bg-emerald-500/10 px-2 py-1 font-mono text-xs text-emerald-200">
+                          {Math.round(suggestion.confidence * 100)}%
+                        </div>
+                      </div>
+                      <div className="mt-3 grid gap-2 text-xs leading-5 text-slate-400">
+                        <div>
+                          <span className="text-slate-500">Source:</span> {suggestion.source}
+                        </div>
+                        <div>
+                          <span className="text-slate-500">Description:</span> {suggestion.description}
+                        </div>
+                        <div>
+                          <span className="text-slate-500">Port:</span> {suggestion.port}{" "}
+                          <span className="text-slate-600">Health:</span> {suggestion.healthPath}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => applySuggestion(suggestion)}
+                        className="mt-3 inline-flex h-9 w-full items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-3 text-sm font-medium text-slate-200 transition hover:border-slate-600 hover:bg-slate-800"
+                      >
+                        <CheckCircle2 className="size-4" />
+                        Apply to config
+                      </button>
+                    </div>
+                  ) : null}
+                </section>
+              ) : null}
+
               <section>
                 <div className="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
                   <Server className="size-3.5" />
