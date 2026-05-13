@@ -30,6 +30,7 @@ type Tab = "dockerfile" | "compose" | "kubernetes" | "helm" | "actions" | "testD
 type Mode = "manual" | "auto";
 type ResolveStatus = "idle" | "loading" | "success" | "error";
 type ResolveTarget = "docker" | "kubernetes" | "compose" | "helm" | "github-actions" | "runtime";
+type ResolveHint = "auto" | ResolveTarget | "app-description";
 type CheckSeverity = "pass" | "warn" | "fail";
 type Theme = "dark" | "light";
 
@@ -93,7 +94,7 @@ type PersistedState = {
   services: ServiceConfig[];
   activeServiceId: string;
   mode: Mode;
-  resolveTarget: ResolveTarget;
+  resolveTarget: ResolveHint;
   resolveQuery: string;
   theme: Theme;
 };
@@ -170,7 +171,7 @@ const STORAGE_KEY = "shipconfig.workbench.v1";
 const SHARE_PARAM = "shipconfig";
 const presetValues: Preset[] = ["node", "python", "go", "static"];
 const modeValues: Mode[] = ["manual", "auto"];
-const resolveTargetValues: ResolveTarget[] = ["docker", "kubernetes", "compose", "helm", "github-actions", "runtime"];
+const resolveHintValues: ResolveHint[] = ["auto", "docker", "compose", "kubernetes", "helm", "github-actions", "runtime", "app-description"];
 
 const tabs: { id: Tab; label: string }[] = [
   { id: "dockerfile", label: "Dockerfile" },
@@ -182,37 +183,48 @@ const tabs: { id: Tab; label: string }[] = [
   { id: "readme", label: "README.md" },
 ];
 
-const resolveTargets: Record<ResolveTarget, { label: string; helper: string; sourceLabel: string }> = {
+const sourceHints: Record<ResolveHint, { label: string; helper: string }> = {
+  auto: {
+    label: "Auto",
+    helper: "Infer the input type from the query, then apply the closest metadata and template hints. All output files are still generated.",
+  },
   docker: {
     label: "Docker image",
-    helper: "Auto Resolve uses curated image templates plus public Docker Hub metadata; verify before production.",
-    sourceLabel: "Image source",
-  },
-  kubernetes: {
-    label: "Kubernetes workload",
-    helper: "Auto Resolve uses curated Kubernetes profiles plus public image metadata; verify before production.",
-    sourceLabel: "Kubernetes source",
+    helper: "Treat the query as a container image or image name while resolving metadata.",
   },
   compose: {
-    label: "Compose stack",
-    helper: "Auto Resolve favors local Docker Compose validation defaults with one replica and localhost-style settings.",
-    sourceLabel: "Compose source",
+    label: "Compose",
+    helper: "Treat the query as Docker Compose context when applying local stack defaults.",
+  },
+  kubernetes: {
+    label: "Kubernetes",
+    helper: "Treat the query as Kubernetes workload context when applying namespace, replica, ingress, and resource hints.",
   },
   helm: {
-    label: "Helm starter",
-    helper: "Auto Resolve shapes values.yaml and chart starter defaults for Kubernetes deployment.",
-    sourceLabel: "Helm source",
+    label: "Helm",
+    helper: "Treat the query as Helm chart context when shaping values and Kubernetes deployment hints.",
   },
   "github-actions": {
     label: "GitHub Actions",
-    helper: "Auto Resolve prepares CI/CD defaults for build, push, and deploy workflows.",
-    sourceLabel: "Workflow source",
+    helper: "Treat the query as CI/CD workflow context when resolving build, push, and deploy defaults.",
   },
   runtime: {
     label: "Runtime/package",
-    helper: "Auto Resolve infers Node, Python, Go, or static starter defaults from the app query.",
-    sourceLabel: "Runtime source",
+    helper: "Treat the query as package/runtime context and infer Node, Python, Go, or static starter defaults.",
   },
+  "app-description": {
+    label: "App description",
+    helper: "Treat the query as a plain-language app description and infer runtime, image name, ports, and deployment defaults.",
+  },
+};
+
+const detectedSourceLabels: Record<ResolveTarget, string> = {
+  docker: "Docker image",
+  compose: "Compose",
+  kubernetes: "Kubernetes",
+  helm: "Helm",
+  "github-actions": "GitHub Actions",
+  runtime: "Runtime/package",
 };
 
 function slug(value: string) {
@@ -329,9 +341,9 @@ function parsePersistedState(raw: string | null): PersistedState | null {
       services,
       activeServiceId: services.some((service) => service.id === activeServiceId) ? activeServiceId : services[0].id,
       mode: modeValues.includes(parsed.mode as Mode) ? (parsed.mode as Mode) : "manual",
-      resolveTarget: resolveTargetValues.includes(parsed.resolveTarget as ResolveTarget)
-        ? (parsed.resolveTarget as ResolveTarget)
-        : "docker",
+      resolveTarget: resolveHintValues.includes(parsed.resolveTarget as ResolveHint)
+        ? (parsed.resolveTarget as ResolveHint)
+        : "auto",
       resolveQuery: coerceString(parsed.resolveQuery, ""),
       theme: parsed.theme === "light" ? "light" : "dark",
     };
@@ -787,7 +799,7 @@ export default function Home() {
   const [savedLocally, setSavedLocally] = useState(false);
   const [hasLoadedClientState, setHasLoadedClientState] = useState(false);
   const [mode, setMode] = useState<Mode>("manual");
-  const [resolveTarget, setResolveTarget] = useState<ResolveTarget>("docker");
+  const [resolveTarget, setResolveTarget] = useState<ResolveHint>("auto");
   const [resolveQuery, setResolveQuery] = useState("");
   const [theme, setTheme] = useState<Theme>("dark");
   const [past, setPast] = useState<HistoryState[]>([]);
@@ -795,6 +807,7 @@ export default function Home() {
   const [resolveStatus, setResolveStatus] = useState<ResolveStatus>("idle");
   const [resolveError, setResolveError] = useState("");
   const [suggestion, setSuggestion] = useState<ResolveSuggestion | null>(null);
+  const [detectedTarget, setDetectedTarget] = useState<ResolveTarget | null>(null);
   const form = services.find((service) => service.id === activeServiceId) ?? services[0] ?? initialService;
   const files = useMemo(() => generateFiles(services, form), [form, services]);
   const preflightChecks = useMemo(() => buildPreflightChecks(form), [form]);
@@ -854,6 +867,7 @@ export default function Home() {
     setResolveQuery(snapshot.resolveQuery);
     setTheme(snapshot.theme);
     setSuggestion(null);
+    setDetectedTarget(null);
     setResolveStatus("idle");
     setResolveError("");
   }
@@ -952,9 +966,10 @@ export default function Home() {
     });
   }
 
-  function selectResolveTarget(target: ResolveTarget) {
+  function selectResolveTarget(target: ResolveHint) {
     commitHistory({ ...currentHistoryState(), resolveTarget: target });
     setSuggestion(null);
+    setDetectedTarget(null);
     setResolveStatus("idle");
     setResolveError("");
   }
@@ -1016,12 +1031,14 @@ export default function Home() {
       setResolveStatus("error");
       setResolveError("Enter an image or app query.");
       setSuggestion(null);
+      setDetectedTarget(null);
       return;
     }
 
     setResolveStatus("loading");
     setResolveError("");
     setSuggestion(null);
+    setDetectedTarget(null);
 
     try {
       const response = await fetch("/api/resolve", {
@@ -1037,6 +1054,7 @@ export default function Home() {
       }
 
       setSuggestion(data.suggestion);
+      setDetectedTarget(data.target);
       setResolveStatus("success");
     } catch (error) {
       setResolveError(error instanceof Error ? error.message : "Unable to resolve image metadata.");
@@ -1309,31 +1327,6 @@ export default function Home() {
                     <Wand2 className="size-3" />
                     Auto Resolve
                   </div>
-                  <div className="grid gap-1 text-[11px] font-medium text-slate-500">
-                    <div id="resolve-target-label">Target/source type</div>
-                    <div className="grid grid-cols-2 gap-1" role="radiogroup" aria-labelledby="resolve-target-label">
-                      {(Object.entries(resolveTargets) as [ResolveTarget, (typeof resolveTargets)[ResolveTarget]][]).map(([target, meta]) => {
-                        const isSelected = resolveTarget === target;
-
-                        return (
-                          <button
-                            key={target}
-                            type="button"
-                            role="radio"
-                            aria-checked={isSelected}
-                            onClick={() => selectResolveTarget(target)}
-                            className={`min-h-8 rounded-md border px-2 py-1.5 text-left text-[11px] font-medium leading-4 transition ${
-                              isSelected
-                                ? "border-sky-400/50 bg-sky-400/15 text-sky-100 shadow-[0_0_0_1px_rgba(56,189,248,0.08)_inset]"
-                                : "border-slate-800 bg-[#070a0f] text-slate-400 hover:border-slate-700 hover:bg-slate-900 hover:text-slate-200"
-                            }`}
-                          >
-                            {meta.label}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
                   <label className="grid gap-1 text-[11px] font-medium text-slate-500">
                     App or image query
                     <div className="grid gap-2 min-[390px]:grid-cols-[minmax(0,1fr)_auto]">
@@ -1357,8 +1350,22 @@ export default function Home() {
                       </button>
                     </div>
                   </label>
+                  <label className="grid gap-1 text-[11px] font-medium text-slate-500 min-[390px]:grid-cols-[auto_minmax(0,1fr)] min-[390px]:items-center min-[390px]:gap-2">
+                    <span>Source hint</span>
+                    <select
+                      value={resolveTarget}
+                      onChange={(e) => selectResolveTarget(e.target.value as ResolveHint)}
+                      className="h-8 rounded-md border border-slate-800 bg-[#070a0f] px-2 text-xs font-normal text-slate-300 outline-none transition focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                    >
+                      {resolveHintValues.map((hint) => (
+                        <option key={hint} value={hint}>
+                          {sourceHints[hint].label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
                   <p className="text-[11px] leading-4 text-slate-500">
-                    {resolveTargets[resolveTarget].helper}
+                    {sourceHints[resolveTarget].helper}
                   </p>
 
                   {resolveStatus === "loading" ? (
@@ -1375,6 +1382,11 @@ export default function Home() {
 
                   {suggestion ? (
                     <div className="rounded-md border border-slate-800 bg-[#070a0f] p-2.5">
+                      {detectedTarget ? (
+                        <div className="mb-2 rounded border border-slate-800 bg-[#090d13] px-2 py-1 font-mono text-[11px] text-slate-400">
+                          Detected: {detectedSourceLabels[detectedTarget]} &middot; Confidence {Math.round(suggestion.confidence * 100)}%
+                        </div>
+                      ) : null}
                       <div className="flex items-start justify-between gap-2">
                         <div className="min-w-0">
                           <div className="truncate text-xs font-semibold text-slate-100">{suggestion.appName}</div>
@@ -1388,11 +1400,8 @@ export default function Home() {
                       </div>
                       <div className="mt-2 grid gap-1.5 text-[11px] leading-4 text-slate-400">
                         <div>
-                          <span className="text-slate-500">{resolveTargets[resolveTarget].sourceLabel}:</span>{" "}
+                          <span className="text-slate-500">Resolver source:</span>{" "}
                           {suggestion.source}
-                        </div>
-                        <div>
-                          <span className="text-slate-500">Confidence:</span> {Math.round(suggestion.confidence * 100)}%
                         </div>
                         <div>
                           <span className="text-slate-500">Description:</span> {suggestion.description}

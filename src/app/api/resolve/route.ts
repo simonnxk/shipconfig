@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 type Preset = "node" | "python" | "go" | "static";
 type ResolveTarget = "docker" | "kubernetes" | "compose" | "helm" | "github-actions" | "runtime";
+type ResolveHint = "auto" | ResolveTarget | "app-description";
 
 type ResolveRequest = {
   query?: unknown;
@@ -169,7 +170,7 @@ const knownHealthPaths: Record<string, string> = {
 };
 
 const statefulWorkloads = new Set(["postgres", "postgresql", "redis", "ollama"]);
-const resolveTargets = new Set<ResolveTarget>(["docker", "kubernetes", "compose", "helm", "github-actions", "runtime"]);
+const resolveHints = new Set<ResolveHint>(["auto", "docker", "kubernetes", "compose", "helm", "github-actions", "runtime", "app-description"]);
 
 const kubernetesProfiles: Record<string, Partial<ResolveSuggestion>> = {
   litellm: {
@@ -296,6 +297,33 @@ function inferPort(name: string) {
 function inferHealthPath(name: string) {
   const key = Object.keys(knownHealthPaths).find((candidate) => name.includes(candidate));
   return key ? knownHealthPaths[key] : "/health";
+}
+
+function inferResolveTarget(query: string): ResolveTarget {
+  const normalized = normalizeKey(query);
+  const words = normalized.split(/[^a-z0-9./:_-]+/).filter(Boolean);
+  const hasPhrase = (phrases: string[]) => phrases.some((phrase) => normalized.includes(phrase));
+
+  if (hasPhrase(["github actions", "workflow", "ci/cd", "ci pipeline", "deploy pipeline"])) {
+    return "github-actions";
+  }
+  if (hasPhrase(["helm", "chart", "values.yaml"])) {
+    return "helm";
+  }
+  if (hasPhrase(["kubernetes", "k8s", "deployment", "ingress", "kubectl", "namespace"])) {
+    return "kubernetes";
+  }
+  if (hasPhrase(["docker compose", "docker-compose", "compose.yaml", "compose.yml"])) {
+    return "compose";
+  }
+  if (hasPhrase(["node", "next", "express", "nestjs", "fastify", "python", "django", "fastapi", "flask", "go api", "golang", "react app", "static site"])) {
+    return "runtime";
+  }
+  if (words.length > 2) {
+    return "runtime";
+  }
+
+  return "docker";
 }
 
 function inferReplicas(name: string) {
@@ -553,6 +581,16 @@ function applyTargetDefaults(target: ResolveTarget, suggestion: ResolveSuggestio
   return suggestion;
 }
 
+function resolveTargetFromHint(hint: ResolveHint, query: string): ResolveTarget {
+  if (hint === "auto") {
+    return inferResolveTarget(query);
+  }
+  if (hint === "app-description") {
+    return "runtime";
+  }
+  return hint;
+}
+
 export async function POST(request: Request) {
   let body: ResolveRequest;
 
@@ -563,17 +601,17 @@ export async function POST(request: Request) {
   }
 
   const query = typeof body.query === "string" ? body.query.trim() : "";
-  const target = typeof body.target === "string" ? body.target : "";
+  const target = typeof body.target === "string" ? body.target : "auto";
 
-  if (!resolveTargets.has(target as ResolveTarget)) {
-    return NextResponse.json({ error: "target must be docker, kubernetes, compose, helm, github-actions, or runtime." }, { status: 400 });
+  if (!resolveHints.has(target as ResolveHint)) {
+    return NextResponse.json({ error: "source hint must be auto, docker, kubernetes, compose, helm, github-actions, runtime, or app-description." }, { status: 400 });
   }
 
   if (!query) {
     return NextResponse.json({ error: "query is required." }, { status: 400 });
   }
 
-  const resolveTarget = target as ResolveTarget;
+  const resolveTarget = resolveTargetFromHint(target as ResolveHint, query);
   const key = normalizeKey(query);
   const dockerSuggestion = curated[key] ?? curated[slug(key)] ?? (await resolveFromDockerHub(query));
   const suggestion = applyTargetDefaults(resolveTarget, dockerSuggestion, query);
