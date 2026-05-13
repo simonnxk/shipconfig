@@ -666,12 +666,12 @@ export default function Home() {
 
             <div className="space-y-5 p-4">
               {mode === "auto" ? (
-                <section className="grid gap-3">
-                  <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
-                    <Wand2 className="size-3.5" />
+                <section className="grid gap-2.5 rounded-lg border border-slate-800 bg-[#090d13]/55 p-3">
+                  <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                    <Wand2 className="size-3" />
                     Auto Resolve
                   </div>
-                  <label className="grid gap-1.5 text-xs font-medium text-slate-400">
+                  <label className="grid gap-1 text-[11px] font-medium text-slate-500">
                     Target/source type
                     <select
                       value={resolveTarget}
@@ -681,15 +681,15 @@ export default function Home() {
                         setResolveStatus("idle");
                         setResolveError("");
                       }}
-                      className="h-9 w-full rounded-lg border border-slate-800 bg-[#070a0f] px-3 text-sm font-normal text-slate-100 outline-none"
+                      className="h-8 w-full rounded-md border border-slate-800 bg-[#070a0f] px-2.5 text-xs font-normal text-slate-200 outline-none transition focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
                     >
                       <option value="docker">Docker image</option>
                       <option value="kubernetes">Kubernetes workload/config</option>
                     </select>
                   </label>
-                  <label className="grid gap-1.5 text-xs font-medium text-slate-400">
+                  <label className="grid gap-1 text-[11px] font-medium text-slate-500">
                     App or image query
-                    <div className="flex gap-2">
+                    <div className="grid gap-2 min-[390px]:grid-cols-[minmax(0,1fr)_auto]">
                       <input
                         value={resolveQuery}
                         onChange={(e) => setResolveQuery(e.target.value)}
@@ -699,50 +699,50 @@ export default function Home() {
                           }
                         }}
                         placeholder="litellm"
-                        className="h-9 min-w-0 flex-1 rounded-lg border border-slate-800 bg-[#070a0f] px-3 text-sm font-normal text-slate-100 outline-none transition placeholder:text-slate-600 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                        className="h-8 min-w-0 rounded-md border border-slate-800 bg-[#070a0f] px-2.5 text-xs font-normal text-slate-200 outline-none transition placeholder:text-slate-600 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
                       />
                       <button
                         onClick={resolveConfig}
                         disabled={resolveStatus === "loading"}
-                        className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-sky-400/30 bg-sky-400/15 px-3 text-sm font-medium text-sky-100 transition hover:border-sky-300/50 hover:bg-sky-400/20 disabled:cursor-not-allowed disabled:opacity-60"
+                        className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-sky-400/30 bg-sky-400/15 px-2.5 text-xs font-medium text-sky-100 transition hover:border-sky-300/50 hover:bg-sky-400/20 disabled:cursor-not-allowed disabled:opacity-60"
                       >
-                        {resolveStatus === "loading" ? <Loader2 className="size-4 animate-spin" /> : <Search className="size-4" />}
+                        {resolveStatus === "loading" ? <Loader2 className="size-3.5 animate-spin" /> : <Search className="size-3.5" />}
                         Resolve
                       </button>
                     </div>
                   </label>
-                  <p className="text-xs leading-5 text-slate-500">
+                  <p className="text-[11px] leading-4 text-slate-500">
                     {resolveTarget === "kubernetes"
                       ? "Auto Resolve uses curated Kubernetes profiles plus public image metadata; verify before production."
                       : "Auto Resolve uses curated image templates plus public Docker Hub metadata; verify before production."}
                   </p>
 
                   {resolveStatus === "loading" ? (
-                    <div className="rounded-lg border border-slate-800 bg-[#090d13] px-3 py-2.5 text-xs text-slate-400">
+                    <div className="rounded-md border border-slate-800 bg-[#070a0f] px-2.5 py-2 text-[11px] text-slate-400">
                       Resolving image metadata and template hints...
                     </div>
                   ) : null}
 
                   {resolveStatus === "error" ? (
-                    <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2.5 text-xs leading-5 text-rose-100">
+                    <div className="rounded-md border border-rose-500/30 bg-rose-500/10 px-2.5 py-2 text-[11px] leading-4 text-rose-100">
                       {resolveError}
                     </div>
                   ) : null}
 
                   {suggestion ? (
-                    <div className="rounded-lg border border-slate-800 bg-[#090d13] p-3">
-                      <div className="flex items-start justify-between gap-3">
+                    <div className="rounded-md border border-slate-800 bg-[#070a0f] p-2.5">
+                      <div className="flex items-start justify-between gap-2">
                         <div className="min-w-0">
-                          <div className="truncate text-sm font-semibold text-slate-100">{suggestion.appName}</div>
-                          <div className="mt-1 truncate font-mono text-xs text-slate-500">
+                          <div className="truncate text-xs font-semibold text-slate-100">{suggestion.appName}</div>
+                          <div className="mt-0.5 truncate font-mono text-[11px] text-slate-500">
                             {suggestion.registry}/{suggestion.image}
                           </div>
                         </div>
-                        <div className="rounded-md border border-emerald-500/25 bg-emerald-500/10 px-2 py-1 font-mono text-xs text-emerald-200">
+                        <div className="rounded border border-emerald-500/25 bg-emerald-500/10 px-1.5 py-0.5 font-mono text-[11px] text-emerald-200">
                           {Math.round(suggestion.confidence * 100)}%
                         </div>
                       </div>
-                      <div className="mt-3 grid gap-2 text-xs leading-5 text-slate-400">
+                      <div className="mt-2 grid gap-1.5 text-[11px] leading-4 text-slate-400">
                         <div>
                           <span className="text-slate-500">{resolveTarget === "kubernetes" ? "Kubernetes source" : "Image source"}:</span>{" "}
                           {suggestion.source}
@@ -774,9 +774,9 @@ export default function Home() {
                       </div>
                       <button
                         onClick={() => applySuggestion(suggestion)}
-                        className="mt-3 inline-flex h-9 w-full items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-3 text-sm font-medium text-slate-200 transition hover:border-slate-600 hover:bg-slate-800"
+                        className="mt-2.5 inline-flex h-8 w-full items-center justify-center gap-1.5 rounded-md border border-slate-700 bg-slate-900 px-2.5 text-xs font-medium text-slate-200 transition hover:border-slate-600 hover:bg-slate-800"
                       >
-                        <CheckCircle2 className="size-4" />
+                        <CheckCircle2 className="size-3.5" />
                         Apply to config
                       </button>
                     </div>
