@@ -1,7 +1,18 @@
 "use client";
 
 import JSZip from "jszip";
-import { Copy, Download, FileCode2, Layers3, Rocket, ShieldCheck, Sparkles } from "lucide-react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Copy,
+  Download,
+  FileCode2,
+  GitBranch,
+  Layers3,
+  Server,
+  Settings2,
+  TerminalSquare,
+} from "lucide-react";
 import { useMemo, useState } from "react";
 
 type Preset = "node" | "python" | "go" | "static";
@@ -80,10 +91,10 @@ const initial: FormState = {
 
 const tabs: { id: Tab; label: string }[] = [
   { id: "dockerfile", label: "Dockerfile" },
-  { id: "compose", label: "Compose" },
-  { id: "kubernetes", label: "Kubernetes" },
-  { id: "helm", label: "Helm" },
-  { id: "actions", label: "GitHub Actions" },
+  { id: "compose", label: "docker-compose.yml" },
+  { id: "kubernetes", label: "k8s.yaml" },
+  { id: "helm", label: "helm/" },
+  { id: "actions", label: ".github/workflows/deploy.yml" },
 ];
 
 function slug(value: string) {
@@ -179,56 +190,192 @@ export default function Home() {
   }
 
   return (
-    <main className="min-h-screen bg-slate-950 text-slate-100">
-      <section className="mx-auto max-w-7xl px-6 py-10 lg:px-8">
-        <nav className="flex items-center justify-between">
-          <div className="flex items-center gap-3"><div className="rounded-2xl bg-cyan-400/15 p-3 text-cyan-300"><Layers3 /></div><span className="text-xl font-bold">ShipConfig</span></div>
-          <button onClick={downloadZip} className="rounded-full bg-cyan-300 px-5 py-2.5 font-semibold text-slate-950 shadow-lg shadow-cyan-500/20 hover:bg-cyan-200"><Download className="mr-2 inline size-4"/>Download ZIP</button>
-        </nav>
-
-        <div className="grid gap-8 py-16 lg:grid-cols-[0.9fr_1.1fr] lg:items-center">
-          <div>
-            <div className="mb-5 inline-flex items-center gap-2 rounded-full border border-cyan-300/20 bg-cyan-300/10 px-4 py-2 text-sm text-cyan-200"><Sparkles className="size-4"/> Docker, Compose, Kubernetes, Helm and CI in one pass</div>
-            <h1 className="text-5xl font-black tracking-tight md:text-7xl">Generate deploy-ready container configs.</h1>
-            <p className="mt-6 max-w-2xl text-lg leading-8 text-slate-300">ShipConfig turns a few app details into production-friendly Dockerfiles, compose stacks, Kubernetes manifests, Helm starter charts and GitHub Actions workflows. Everything runs in your browser — no secrets leave the page.</p>
-            <div className="mt-8 grid gap-3 sm:grid-cols-3">
-              {["Copy-ready YAML", "Health probes", "Resource limits"].map((item) => <div key={item} className="rounded-2xl border border-white/10 bg-white/[0.04] p-4 text-sm text-slate-200"><ShieldCheck className="mb-2 size-5 text-emerald-300"/>{item}</div>)}
-            </div>
-          </div>
-          <div className="rounded-3xl border border-white/10 bg-white/[0.04] p-5 shadow-2xl shadow-cyan-950/40 backdrop-blur">
-            <div className="grid gap-3 sm:grid-cols-2">
-              {(Object.keys(presets) as Preset[]).map((p) => <button key={p} onClick={() => applyPreset(p)} className={`rounded-2xl border p-4 text-left transition ${form.preset === p ? "border-cyan-300 bg-cyan-300/10" : "border-white/10 bg-slate-900/70 hover:border-white/30"}`}><div className="font-semibold">{presets[p].label}</div><div className="mt-1 text-xs text-slate-400">{presets[p].description}</div></button>)}
-            </div>
-          </div>
-        </div>
-
-        <section className="grid gap-6 lg:grid-cols-[420px_1fr]">
-          <div className="rounded-3xl border border-white/10 bg-slate-900/80 p-5">
-            <h2 className="mb-4 flex items-center gap-2 text-xl font-bold"><Rocket className="text-cyan-300"/> Configure</h2>
-            <div className="grid gap-4">
-              {[
-                ["App name", "appName"], ["Image", "image"], ["Registry", "registry"], ["Namespace", "namespace"], ["Ingress host", "ingressHost"], ["Health path", "healthPath"], ["CPU", "cpu"], ["Memory", "memory"],
-              ].map(([label, key]) => <label key={key} className="text-sm text-slate-300">{label}<input value={String(form[key as keyof FormState])} onChange={(e) => update(key as keyof FormState, e.target.value as never)} className="mt-1 w-full rounded-xl border border-white/10 bg-slate-950 px-3 py-2 text-slate-100 outline-none focus:border-cyan-300"/></label>)}
-              <div className="grid grid-cols-2 gap-3">
-                <label className="text-sm text-slate-300">Port<input type="number" value={form.port} onChange={(e) => update("port", Number(e.target.value))} className="mt-1 w-full rounded-xl border border-white/10 bg-slate-950 px-3 py-2"/></label>
-                <label className="text-sm text-slate-300">Replicas<input type="number" value={form.replicas} onChange={(e) => update("replicas", Number(e.target.value))} className="mt-1 w-full rounded-xl border border-white/10 bg-slate-950 px-3 py-2"/></label>
+    <main className="min-h-screen bg-[#080b10] text-slate-100">
+      <div className="flex min-h-screen flex-col">
+        <header className="sticky top-0 z-20 border-b border-slate-800/90 bg-[#090d13]/95 backdrop-blur">
+          <div className="mx-auto flex max-w-[1540px] items-center justify-between gap-3 px-4 py-3 sm:px-5 lg:px-6">
+            <div className="flex min-w-0 items-center gap-3">
+              <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-slate-700/80 bg-slate-900 text-sky-300">
+                <Layers3 className="size-4" />
               </div>
-              <label className="text-sm text-slate-300">Config env vars<textarea value={form.envVars} onChange={(e) => update("envVars", e.target.value)} rows={4} className="mt-1 w-full rounded-xl border border-white/10 bg-slate-950 px-3 py-2 font-mono text-xs"/></label>
-              <label className="text-sm text-slate-300">Secret placeholders<textarea value={form.secrets} onChange={(e) => update("secrets", e.target.value)} rows={4} className="mt-1 w-full rounded-xl border border-white/10 bg-slate-950 px-3 py-2 font-mono text-xs"/></label>
-              {validation.length > 0 && <div className="rounded-xl border border-amber-300/30 bg-amber-300/10 p-3 text-sm text-amber-100">{validation.join(" · ")}</div>}
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <h1 className="truncate text-sm font-semibold tracking-wide text-slate-100">ShipConfig</h1>
+                  <span className="hidden rounded-md border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-400 sm:inline">
+                    Infra Workbench
+                  </span>
+                </div>
+                <p className="hidden text-xs text-slate-500 sm:block">Docker, Compose, Kubernetes, Helm and CI config generator</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className={`hidden items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs md:flex ${validation.length ? "border-amber-500/30 bg-amber-500/10 text-amber-200" : "border-emerald-500/25 bg-emerald-500/10 text-emerald-200"}`}>
+                {validation.length ? <AlertTriangle className="size-3.5" /> : <CheckCircle2 className="size-3.5" />}
+                {validation.length ? `${validation.length} issue${validation.length > 1 ? "s" : ""}` : "Valid"}
+              </div>
+              <button
+                onClick={downloadZip}
+                className="inline-flex h-9 items-center gap-2 rounded-lg border border-sky-400/30 bg-sky-400/15 px-3 text-sm font-medium text-sky-100 transition hover:border-sky-300/50 hover:bg-sky-400/20"
+              >
+                <Download className="size-4" />
+                <span className="hidden sm:inline">Download ZIP</span>
+                <span className="sm:hidden">ZIP</span>
+              </button>
             </div>
           </div>
+        </header>
 
-          <div className="overflow-hidden rounded-3xl border border-white/10 bg-slate-900/80">
-            <div className="flex flex-wrap gap-2 border-b border-white/10 p-3">
-              {tabs.map((tab) => <button key={tab.id} onClick={() => setActive(tab.id)} className={`rounded-full px-4 py-2 text-sm font-medium ${active === tab.id ? "bg-cyan-300 text-slate-950" : "bg-white/5 text-slate-300 hover:bg-white/10"}`}>{tab.label}</button>)}
-              <button onClick={() => copy(files[selected], selected)} className="ml-auto rounded-full bg-white/10 px-4 py-2 text-sm hover:bg-white/15"><Copy className="mr-2 inline size-4"/>{copied === selected ? "Copied" : "Copy"}</button>
+        <section className="mx-auto grid w-full max-w-[1540px] flex-1 gap-4 px-4 py-4 sm:px-5 lg:grid-cols-[360px_minmax(0,1fr)] lg:px-6">
+          <aside className="rounded-xl border border-slate-800 bg-[#0c1118] shadow-[0_1px_0_rgba(255,255,255,0.03)_inset] lg:max-h-[calc(100vh-96px)] lg:overflow-auto">
+            <div className="border-b border-slate-800 px-4 py-3">
+              <div className="flex items-center gap-2 text-sm font-semibold text-slate-200">
+                <Settings2 className="size-4 text-sky-300" />
+                Settings
+              </div>
             </div>
-            <div className="flex items-center gap-2 border-b border-white/10 px-5 py-3 text-sm text-slate-400"><FileCode2 className="size-4"/>{selected}</div>
-            <pre className="max-h-[720px] overflow-auto p-5 text-sm leading-6 text-slate-200"><code>{files[selected]}</code></pre>
-          </div>
+
+            <div className="space-y-5 p-4">
+              <section>
+                <div className="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+                  <Server className="size-3.5" />
+                  Presets
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-1">
+                  {(Object.keys(presets) as Preset[]).map((p) => (
+                    <button
+                      key={p}
+                      onClick={() => applyPreset(p)}
+                      className={`rounded-lg border px-3 py-2.5 text-left transition ${
+                        form.preset === p
+                          ? "border-sky-400/45 bg-sky-400/10 text-sky-100"
+                          : "border-slate-800 bg-[#090d13] text-slate-300 hover:border-slate-700 hover:bg-slate-900"
+                      }`}
+                    >
+                      <div className="text-sm font-medium">{presets[p].label}</div>
+                      <div className="mt-1 text-xs leading-5 text-slate-500">{presets[p].description}</div>
+                    </button>
+                  ))}
+                </div>
+              </section>
+
+              <section className="grid gap-3">
+                <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+                  <TerminalSquare className="size-3.5" />
+                  Runtime
+                </div>
+                {[
+                  ["App name", "appName"],
+                  ["Image", "image"],
+                  ["Registry", "registry"],
+                  ["Namespace", "namespace"],
+                  ["Ingress host", "ingressHost"],
+                  ["Health path", "healthPath"],
+                  ["CPU", "cpu"],
+                  ["Memory", "memory"],
+                ].map(([label, key]) => (
+                  <label key={key} className="grid gap-1.5 text-xs font-medium text-slate-400">
+                    {label}
+                    <input
+                      value={String(form[key as keyof FormState])}
+                      onChange={(e) => update(key as keyof FormState, e.target.value as never)}
+                      className="h-9 w-full rounded-lg border border-slate-800 bg-[#070a0f] px-3 text-sm font-normal text-slate-100 outline-none transition placeholder:text-slate-600 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                    />
+                  </label>
+                ))}
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="grid gap-1.5 text-xs font-medium text-slate-400">
+                    Port
+                    <input
+                      type="number"
+                      value={form.port}
+                      onChange={(e) => update("port", Number(e.target.value))}
+                      className="h-9 w-full rounded-lg border border-slate-800 bg-[#070a0f] px-3 text-sm font-normal text-slate-100 outline-none transition focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                    />
+                  </label>
+                  <label className="grid gap-1.5 text-xs font-medium text-slate-400">
+                    Replicas
+                    <input
+                      type="number"
+                      value={form.replicas}
+                      onChange={(e) => update("replicas", Number(e.target.value))}
+                      className="h-9 w-full rounded-lg border border-slate-800 bg-[#070a0f] px-3 text-sm font-normal text-slate-100 outline-none transition focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                    />
+                  </label>
+                </div>
+              </section>
+
+              <section className="grid gap-3">
+                <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+                  <FileCode2 className="size-3.5" />
+                  Environment
+                </div>
+                <label className="grid gap-1.5 text-xs font-medium text-slate-400">
+                  Config env vars
+                  <textarea
+                    value={form.envVars}
+                    onChange={(e) => update("envVars", e.target.value)}
+                    rows={5}
+                    className="w-full resize-y rounded-lg border border-slate-800 bg-[#070a0f] px-3 py-2 font-mono text-xs font-normal leading-5 text-slate-100 outline-none transition focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                  />
+                </label>
+                <label className="grid gap-1.5 text-xs font-medium text-slate-400">
+                  Secret placeholders
+                  <textarea
+                    value={form.secrets}
+                    onChange={(e) => update("secrets", e.target.value)}
+                    rows={5}
+                    className="w-full resize-y rounded-lg border border-slate-800 bg-[#070a0f] px-3 py-2 font-mono text-xs font-normal leading-5 text-slate-100 outline-none transition focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                  />
+                </label>
+              </section>
+
+              <div className={`rounded-lg border px-3 py-2.5 text-xs leading-5 ${validation.length ? "border-amber-500/30 bg-amber-500/10 text-amber-100" : "border-emerald-500/25 bg-emerald-500/10 text-emerald-100"}`}>
+                <div className="mb-1 flex items-center gap-2 font-medium">
+                  {validation.length ? <AlertTriangle className="size-3.5" /> : <CheckCircle2 className="size-3.5" />}
+                  Validation
+                </div>
+                {validation.length ? validation.join(" | ") : "Configuration is ready to export."}
+              </div>
+            </div>
+          </aside>
+
+          <section className="min-w-0 overflow-hidden rounded-xl border border-slate-800 bg-[#0c1118] shadow-[0_1px_0_rgba(255,255,255,0.03)_inset]">
+            <div className="flex min-h-12 flex-col gap-2 border-b border-slate-800 bg-[#0a0f15] px-3 py-2 xl:flex-row xl:items-center">
+              <div className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto">
+                {tabs.map((tab) => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setActive(tab.id)}
+                    className={`inline-flex h-8 shrink-0 items-center gap-2 rounded-lg border px-3 font-mono text-xs transition ${
+                      active === tab.id
+                        ? "border-sky-400/40 bg-sky-400/12 text-sky-100"
+                        : "border-transparent text-slate-400 hover:border-slate-800 hover:bg-slate-900 hover:text-slate-200"
+                    }`}
+                  >
+                    <FileCode2 className="size-3.5" />
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+              <button
+                onClick={() => copy(files[selected], selected)}
+                className="inline-flex h-8 items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-3 text-sm font-medium text-slate-200 transition hover:border-slate-600 hover:bg-slate-800 xl:ml-3"
+              >
+                <Copy className="size-4" />
+                {copied === selected ? "Copied" : "Copy"}
+              </button>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 px-4 py-2.5">
+              <div className="flex min-w-0 items-center gap-2 text-sm text-slate-400">
+                <GitBranch className="size-4 shrink-0 text-sky-300" />
+                <span className="truncate font-mono">{selected}</span>
+              </div>
+              <div className="font-mono text-xs text-slate-600">{files[selected].split("\n").length} lines</div>
+            </div>
+            <pre className="max-h-[calc(100vh-169px)] min-h-[520px] overflow-auto bg-[#070a0f] p-4 font-mono text-sm leading-6 text-slate-200 sm:p-5"><code>{files[selected]}</code></pre>
+          </section>
         </section>
-      </section>
+      </div>
     </main>
   );
 }
