@@ -1,5 +1,7 @@
 "use client";
 
+import { createLocalFirstProWorkspaceAdapters } from "@/lib/platform/local-first";
+import type { AuthIdentity, Team, TeamMembership } from "@/types/platform";
 import JSZip from "jszip";
 import {
   AlertTriangle,
@@ -23,7 +25,7 @@ import {
   Undo2,
   Wand2,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type Preset = "node" | "python" | "go" | "static";
 type Tab = "dockerfile" | "compose" | "kubernetes" | "helm" | "actions" | "testDeploy" | "readme";
@@ -107,6 +109,50 @@ type ScoreResult = {
   recommendations: string[];
 };
 
+type ProTeam = Team & {
+  role: TeamMembership["role"];
+};
+
+type SavedProjectVersion = {
+  id: string;
+  label: string;
+  createdAt: string;
+  createdByIdentityId: string;
+  snapshot: PersistedState;
+};
+
+type SavedProject = {
+  id: string;
+  teamId: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  activeVersionId: string;
+  versions: SavedProjectVersion[];
+};
+
+type WorkspacePreset = {
+  id: string;
+  teamId: string;
+  name: string;
+  scope: "service" | "workspace";
+  createdAt: string;
+  updatedAt: string;
+  service?: ServiceConfig;
+  snapshot?: PersistedState;
+};
+
+type ProWorkspaceState = {
+  version: 1;
+  identity: AuthIdentity;
+  teams: ProTeam[];
+  selectedTeamId: string;
+  selectedProjectId: string | null;
+  selectedVersionId: string | null;
+  projects: SavedProject[];
+  presets: WorkspacePreset[];
+};
+
 const presets: Record<Preset, Partial<FormState> & { label: string; description: string }> = {
   node: {
     label: "Node.js API",
@@ -169,6 +215,7 @@ const initialService: ServiceConfig = {
 
 const STORAGE_KEY = "shipconfig.workbench.v1";
 const SHARE_PARAM = "shipconfig";
+const proWorkspaceAdapters = createLocalFirstProWorkspaceAdapters();
 const presetValues: Preset[] = ["node", "python", "go", "static"];
 const modeValues: Mode[] = ["manual", "auto"];
 const resolveHintValues: ResolveHint[] = ["auto", "docker", "compose", "kubernetes", "helm", "github-actions", "runtime", "app-description"];
@@ -289,12 +336,16 @@ function coerceFormState(value: unknown): FormState | null {
   };
 }
 
-function makeServiceId() {
+function makeId(prefix: string) {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return `svc-${crypto.randomUUID()}`;
+    return `${prefix}-${crypto.randomUUID()}`;
   }
 
-  return `svc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function makeServiceId() {
+  return makeId("svc");
 }
 
 function coerceServiceConfig(value: unknown, fallbackId = makeServiceId()): ServiceConfig | null {
@@ -352,14 +403,343 @@ function parsePersistedState(raw: string | null): PersistedState | null {
   }
 }
 
-function parseSharedState() {
-  if (typeof window === "undefined") {
+function clonePersistedState(state: PersistedState): PersistedState {
+  return {
+    ...state,
+    services: state.services.map((service) => ({ ...service })),
+  };
+}
+
+function isSafeSecretPlaceholder(value: string) {
+  return /^\[[A-Z0-9_]+_PLACEHOLDER\]$/.test(value.trim());
+}
+
+function sanitizeSecretsForSerialization(value: string) {
+  return value
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        return line;
+      }
+
+      const [key, ...rest] = line.split("=");
+      if (!key.trim() || !rest.length) {
+        return isSafeSecretPlaceholder(trimmed) ? trimmed : `SECRET=${placeholderTokenFor("SECRET")}`;
+      }
+
+      const secretValue = rest.join("=").trim();
+      return `${key.trim()}=${isSafeSecretPlaceholder(secretValue) ? secretValue : placeholderTokenFor(key)}`;
+    })
+    .join("\n");
+}
+
+function sanitizeFormSecrets(form: FormState): FormState {
+  return {
+    ...form,
+    secrets: sanitizeSecretsForSerialization(form.secrets),
+  };
+}
+
+function sanitizeServiceSecrets(service: ServiceConfig): ServiceConfig {
+  return {
+    ...service,
+    secrets: sanitizeSecretsForSerialization(service.secrets),
+  };
+}
+
+function sanitizePersistedSnapshot(state: PersistedState): PersistedState {
+  return {
+    ...state,
+    form: state.form ? sanitizeFormSecrets(state.form) : undefined,
+    services: state.services.map(sanitizeServiceSecrets),
+  };
+}
+
+function sanitizeWorkspacePreset(preset: WorkspacePreset): WorkspacePreset {
+  return {
+    ...preset,
+    service: preset.service ? sanitizeServiceSecrets(preset.service) : undefined,
+    snapshot: preset.snapshot ? sanitizePersistedSnapshot(preset.snapshot) : undefined,
+  };
+}
+
+function sanitizeProWorkspaceState(state: ProWorkspaceState): ProWorkspaceState {
+  return {
+    ...state,
+    projects: state.projects.map((project) => ({
+      ...project,
+      versions: project.versions.map((version) => ({
+        ...version,
+        snapshot: sanitizePersistedSnapshot(version.snapshot),
+      })),
+    })),
+    presets: state.presets.map(sanitizeWorkspacePreset),
+  };
+}
+
+function coercePersistedSnapshot(value: unknown): PersistedState | null {
+  try {
+    return parsePersistedState(JSON.stringify(value));
+  } catch {
+    return null;
+  }
+}
+
+function emptyProWorkspaceState(): ProWorkspaceState {
+  return defaultProWorkspaceState(
+    {
+      id: "identity-pending",
+      providerKind: "custom",
+      providerSubject: "pending",
+      displayName: "Local workspace",
+    },
+    [{ id: "team-pending", name: "Local Workspace", slug: "local", role: "owner" }],
+  );
+}
+
+function fallbackProTeam(): ProTeam {
+  return { id: "team-local", name: "Local Workspace", slug: "local", role: "owner" };
+}
+
+function defaultProWorkspaceState(identity: AuthIdentity, teams: ProTeam[]): ProWorkspaceState {
+  const normalizedTeams = teams.length ? teams : [fallbackProTeam()];
+
+  return {
+    version: 1,
+    identity,
+    teams: normalizedTeams,
+    selectedTeamId: normalizedTeams[0].id,
+    selectedProjectId: null,
+    selectedVersionId: null,
+    projects: [],
+    presets: [],
+  };
+}
+
+function cloneSavedProject(project: SavedProject, identityId?: string): SavedProject {
+  return {
+    ...project,
+    versions: project.versions.map((version) => ({
+      ...version,
+      createdByIdentityId: version.createdByIdentityId === "identity-pending" && identityId ? identityId : version.createdByIdentityId,
+      snapshot: sanitizePersistedSnapshot(clonePersistedState(version.snapshot)),
+    })),
+  };
+}
+
+function cloneWorkspacePreset(preset: WorkspacePreset): WorkspacePreset {
+  return sanitizeWorkspacePreset({
+    ...preset,
+    service: preset.service ? { ...preset.service } : undefined,
+    snapshot: preset.snapshot ? clonePersistedState(preset.snapshot) : undefined,
+  });
+}
+
+function normalizeProWorkspaceState(state: ProWorkspaceState): ProWorkspaceState {
+  const teams = state.teams.length ? state.teams : [fallbackProTeam()];
+  const selectedTeamId = teams.some((team) => team.id === state.selectedTeamId) ? state.selectedTeamId : teams[0].id;
+  const selectedProject = state.projects.find((project) => project.teamId === selectedTeamId && project.id === state.selectedProjectId) ?? null;
+  const selectedVersionId =
+    selectedProject && selectedProject.versions.some((version) => version.id === state.selectedVersionId)
+      ? state.selectedVersionId
+      : selectedProject?.activeVersionId ?? null;
+
+  return {
+    ...state,
+    teams,
+    selectedTeamId,
+    selectedProjectId: selectedProject?.id ?? null,
+    selectedVersionId,
+  };
+}
+
+function selectedProTeam(state: ProWorkspaceState) {
+  return state.teams.find((team) => team.id === state.selectedTeamId) ?? state.teams[0] ?? fallbackProTeam();
+}
+
+function selectedProProject(state: ProWorkspaceState) {
+  const team = selectedProTeam(state);
+  return state.projects.find((project) => project.teamId === team.id && project.id === state.selectedProjectId) ?? null;
+}
+
+function mergeLoadedProWorkspaceState(loaded: ProWorkspaceState, current: ProWorkspaceState): ProWorkspaceState {
+  const loadedTeamIds = new Set(loaded.teams.map((team) => team.id));
+  const fallbackTeamId = loaded.selectedTeamId;
+  const teamIdFor = (teamId: string) => (loadedTeamIds.has(teamId) ? teamId : fallbackTeamId);
+  const projectsById = new Map(loaded.projects.map((project) => [project.id, cloneSavedProject(project)]));
+  const presetsById = new Map(loaded.presets.map((preset) => [preset.id, cloneWorkspacePreset(preset)]));
+
+  current.projects.forEach((project) => {
+    projectsById.set(project.id, {
+      ...cloneSavedProject(project, loaded.identity.id),
+      teamId: teamIdFor(project.teamId),
+    });
+  });
+
+  current.presets.forEach((preset) => {
+    presetsById.set(preset.id, {
+      ...cloneWorkspacePreset(preset),
+      teamId: teamIdFor(preset.teamId),
+    });
+  });
+
+  return normalizeProWorkspaceState({
+    ...loaded,
+    selectedTeamId: teamIdFor(current.selectedTeamId),
+    selectedProjectId: current.selectedProjectId ?? loaded.selectedProjectId,
+    selectedVersionId: current.selectedVersionId ?? loaded.selectedVersionId,
+    projects: Array.from(projectsById.values()),
+    presets: Array.from(presetsById.values()),
+  });
+}
+
+function teamsWithRoles(teams: Team[], memberships: TeamMembership[]): ProTeam[] {
+  const roleByTeamId = new Map(memberships.map((membership) => [membership.teamId, membership.role]));
+  return teams.map((team) => ({
+    ...team,
+    role: roleByTeamId.get(team.id) ?? "viewer",
+  }));
+}
+
+function coerceProTeam(value: unknown): ProTeam | null {
+  if (!isRecord(value)) {
     return null;
   }
 
-  const queryValue = new URLSearchParams(window.location.search).get(SHARE_PARAM);
-  const hashValue = new URLSearchParams(window.location.hash.replace(/^#/, "")).get(SHARE_PARAM);
-  const encoded = queryValue || hashValue;
+  const name = coerceString(value.name, "");
+  const id = coerceString(value.id, "");
+  if (!id || !name) {
+    return null;
+  }
+
+  const roleValues: ProTeam["role"][] = ["owner", "admin", "editor", "reviewer", "viewer"];
+  const role = roleValues.includes(value.role as ProTeam["role"]) ? (value.role as ProTeam["role"]) : "editor";
+
+  return {
+    id,
+    name,
+    slug: coerceString(value.slug, slug(name)),
+    role,
+  };
+}
+
+function coerceProjectVersion(value: unknown, identityId: string): SavedProjectVersion | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const snapshot = coercePersistedSnapshot(value.snapshot);
+  if (!snapshot) {
+    return null;
+  }
+
+  return {
+    id: coerceString(value.id, makeId("ver")),
+    label: coerceString(value.label, "Saved version"),
+    createdAt: coerceString(value.createdAt, new Date().toISOString()),
+    createdByIdentityId: coerceString(value.createdByIdentityId, coerceString(value.createdBy, identityId)),
+    snapshot: sanitizePersistedSnapshot(snapshot),
+  };
+}
+
+function coerceSavedProject(value: unknown, identityId: string, fallbackTeamId: string): SavedProject | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const id = coerceString(value.id, makeId("proj"));
+  const versions = Array.isArray(value.versions)
+    ? value.versions.map((version) => coerceProjectVersion(version, identityId)).filter((version): version is SavedProjectVersion => Boolean(version))
+    : [];
+
+  if (!versions.length) {
+    return null;
+  }
+
+  const activeVersionId = coerceString(value.activeVersionId, versions.at(-1)?.id ?? versions[0].id);
+
+  return {
+    id,
+    teamId: coerceString(value.teamId, fallbackTeamId),
+    name: coerceString(value.name, "Saved project"),
+    createdAt: coerceString(value.createdAt, versions[0].createdAt),
+    updatedAt: coerceString(value.updatedAt, versions.at(-1)?.createdAt ?? versions[0].createdAt),
+    activeVersionId: versions.some((version) => version.id === activeVersionId) ? activeVersionId : versions.at(-1)?.id ?? versions[0].id,
+    versions,
+  };
+}
+
+function coerceWorkspacePreset(value: unknown, fallbackTeamId: string): WorkspacePreset | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const scope = value.scope === "workspace" ? "workspace" : "service";
+  const service = scope === "service" ? coerceServiceConfig(value.service, makeServiceId()) : undefined;
+  const snapshot = scope === "workspace" ? coercePersistedSnapshot(value.snapshot) : undefined;
+  if ((scope === "service" && !service) || (scope === "workspace" && !snapshot)) {
+    return null;
+  }
+
+  const name = coerceString(value.name, scope === "service" ? "Service preset" : "Workspace preset");
+  const createdAt = coerceString(value.createdAt, new Date().toISOString());
+
+  return {
+    id: coerceString(value.id, makeId("preset")),
+    teamId: coerceString(value.teamId, fallbackTeamId),
+    name,
+    scope,
+    createdAt,
+    updatedAt: coerceString(value.updatedAt, createdAt),
+    service: service ? sanitizeServiceSecrets(service) : undefined,
+    snapshot: snapshot ? sanitizePersistedSnapshot(snapshot) : undefined,
+  };
+}
+
+function parseProWorkspaceState(raw: unknown, identity: AuthIdentity, teams: ProTeam[]): ProWorkspaceState {
+  const fallback = defaultProWorkspaceState(identity, teams);
+  if (!raw) {
+    return fallback;
+  }
+
+  try {
+    const parsed = typeof raw === "string" ? (JSON.parse(raw) as unknown) : raw;
+    if (!isRecord(parsed)) {
+      return fallback;
+    }
+
+    const parsedTeams = Array.isArray(parsed.teams)
+      ? parsed.teams.map(coerceProTeam).filter((team): team is ProTeam => Boolean(team))
+      : [];
+    const normalizedTeams = teams.length ? teams : parsedTeams.length ? parsedTeams : fallback.teams;
+    const fallbackTeamId = normalizedTeams[0].id;
+    const selectedTeamId = coerceString(parsed.selectedTeamId, normalizedTeams[0].id);
+    const projects = Array.isArray(parsed.projects)
+      ? parsed.projects.map((project) => coerceSavedProject(project, identity.id, fallbackTeamId)).filter((project): project is SavedProject => Boolean(project))
+      : [];
+    const presets = Array.isArray(parsed.presets)
+      ? parsed.presets.map((preset) => coerceWorkspacePreset(preset, fallbackTeamId)).filter((preset): preset is WorkspacePreset => Boolean(preset))
+      : [];
+    const selectedProjectId = coerceString(parsed.selectedProjectId, "");
+    const selectedVersionId = coerceString(parsed.selectedVersionId, "");
+
+    return {
+      version: 1,
+      identity,
+      teams: normalizedTeams,
+      selectedTeamId: normalizedTeams.some((team) => team.id === selectedTeamId) ? selectedTeamId : normalizedTeams[0].id,
+      selectedProjectId: projects.some((project) => project.id === selectedProjectId) ? selectedProjectId : null,
+      selectedVersionId: projects.some((project) => project.versions.some((version) => version.id === selectedVersionId)) ? selectedVersionId : null,
+      projects,
+      presets,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function parseShareParamValue(encoded: string | null) {
   if (!encoded) {
     return null;
   }
@@ -374,6 +754,40 @@ function parseSharedState() {
   } catch {
     return null;
   }
+}
+
+function parseSharedStateFromUrl(url: URL) {
+  const hashParams = new URLSearchParams(url.hash.replace(/^#/, ""));
+  if (hashParams.has(SHARE_PARAM)) {
+    return parseShareParamValue(hashParams.get(SHARE_PARAM));
+  }
+
+  if (url.searchParams.has(SHARE_PARAM)) {
+    return parseShareParamValue(url.searchParams.get(SHARE_PARAM));
+  }
+
+  return null;
+}
+
+function parseSharedState() {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  try {
+    return parseSharedStateFromUrl(new URL(window.location.href));
+  } catch {
+    return null;
+  }
+}
+
+function shareUrlFor(href: string, state: PersistedState) {
+  const url = new URL(href);
+  url.searchParams.delete(SHARE_PARAM);
+  const hashParams = new URLSearchParams();
+  hashParams.set(SHARE_PARAM, JSON.stringify(sanitizePersistedSnapshot(state)));
+  url.hash = hashParams.toString();
+  return url.toString();
 }
 
 function imageWithPinnedPlaceholder(image: string) {
@@ -601,7 +1015,7 @@ ${serviceRows}
 - \`Dockerfile\`: Container build template for the active service runtime preset.
 - \`docker-compose.yml\`: Local Compose stack for every configured service.
 - \`k8s.yaml\`: Namespace, ConfigMap, Secret placeholder, Deployment, Service, and Ingress blocks for every service.
-- \`helm/Chart-and-values.yaml\`: Starter Helm chart content and values.
+- \`helm/Chart.yaml\`, \`helm/values.yaml\`, and \`helm/templates/*.yaml\`: Starter Helm chart files.
 - \`.github/workflows/deploy.yml\`: GitHub Actions build/push/deploy workflow starter.
 - \`test-deploy.sh\`: Validation helper with no-side-effect defaults and opt-in smoke-test commands.
 - \`README.md\`: This generated guide.
@@ -689,7 +1103,7 @@ The generated Kubernetes Secret uses placeholder string data and this README int
 - Replace \`:latest\` or floating image tags with immutable tags or digests.
 - Add TLS configuration for Ingress before exposing public traffic.
 - Add pod security settings, non-root runtime settings, and read-only filesystem options where your app supports them.
-- Split ConfigMap, Secret, Deployment, Service, and Ingress into separate files or a full Helm chart as the project grows.
+- Expand the Helm chart with TLS, image pull secrets, service accounts, autoscaling, and policy controls as the project grows.
 - Review HTTP probes for stateful or non-HTTP workloads; Redis/Postgres-style services usually need TCP or command probes.
 - Tune resource requests/limits and autoscaling from real measurements.
 - Add observability: structured logs, metrics, traces, alerts, and dashboard links.
@@ -737,15 +1151,61 @@ function kubernetesServiceFor(service: ServiceConfig) {
   return `apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: ${name}-config\n  namespace: ${service.namespace}\ndata:\n${cmData}\n---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: ${name}-secret\n  namespace: ${service.namespace}\ntype: Opaque\nstringData:\n${secretData}\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: ${name}\n  namespace: ${service.namespace}\nspec:\n  replicas: ${service.replicas}\n  selector:\n    matchLabels:\n      app: ${name}\n  template:\n    metadata:\n      labels:\n        app: ${name}\n    spec:\n      containers:\n        - name: ${name}\n          image: ${fullImageFor(service)}\n          ports:\n            - containerPort: ${service.port}\n          env:\n${envBlock}${envBlock && secretBlock ? "\n" : ""}${secretBlock || "            - name: APP_ENV\n              value: production"}\n          resources:\n            requests:\n              cpu: ${service.cpu || initial.cpu}\n              memory: ${service.memory || initial.memory}\n            limits:\n              cpu: ${service.cpu || initial.cpu}\n              memory: ${service.memory || initial.memory}\n          readinessProbe:\n            httpGet:\n              path: ${healthPathFor(service)}\n              port: ${service.port}\n            initialDelaySeconds: 10\n            periodSeconds: 10\n          livenessProbe:\n            httpGet:\n              path: ${healthPathFor(service)}\n              port: ${service.port}\n            initialDelaySeconds: 30\n            periodSeconds: 20\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: ${name}\n  namespace: ${service.namespace}\nspec:\n  selector:\n    app: ${name}\n  ports:\n    - name: http\n      port: 80\n      targetPort: ${service.port}\n---\napiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: ${name}\n  namespace: ${service.namespace}\n  annotations:\n    kubernetes.io/ingress.class: nginx\nspec:\n  rules:\n    - host: ${service.ingressHost}\n      http:\n        paths:\n          - path: /\n            pathType: Prefix\n            backend:\n              service:\n                name: ${name}\n                port:\n                  number: 80`;
 }
 
-function helmFor(services: ServiceConfig[], primary: ServiceConfig) {
-  const valuesServices = services
-    .map((service) => {
+function yamlPairsForValues(pairs: { key: string; value: string }[], fallbackKey: string, fallbackValue: string) {
+  const source = pairs.length ? pairs : [{ key: fallbackKey, value: fallbackValue }];
+  return source.map((pair) => `      ${pair.key}: "${yamlString(pair.value)}"`).join("\n");
+}
+
+function helmEntriesFor(services: ServiceConfig[]) {
+  const counts = new Map<string, number>();
+
+  return services.map((service) => {
+    const base = slug(service.appName);
+    const nextCount = (counts.get(base) ?? 0) + 1;
+    counts.set(base, nextCount);
+
+    return {
+      key: nextCount === 1 ? base : `${base}-${nextCount}`,
+      service,
+    };
+  });
+}
+
+function helmFilesFor(services: ServiceConfig[], primary: ServiceConfig) {
+  const entries = helmEntriesFor(services);
+  const valuesServices = entries
+    .map(({ key, service }) => {
       const env = parsePairs(service.envVars);
-      return `  ${slug(service.appName)}:\n    image: ${fullImageFor(service)}\n    replicas: ${service.replicas}\n    port: ${service.port}\n    ingressHost: ${service.ingressHost}\n    resources:\n      cpu: ${service.cpu || initial.cpu}\n      memory: ${service.memory || initial.memory}\n    env:\n${env.map((p) => `      ${p.key}: "${yamlString(p.value)}"`).join("\n") || "      APP_ENV: production"}`;
+      const secrets = parsePairs(service.secrets);
+      const ingressEnabled = Boolean(service.ingressHost.trim());
+
+      return `  ${key}:\n    name: ${key}\n    image: "${yamlString(fullImageFor(service))}"\n    replicas: ${service.replicas}\n    port: ${service.port}\n    healthPath: "${yamlString(healthPathFor(service))}"\n    ingress:\n      enabled: ${ingressEnabled}\n      host: "${yamlString(service.ingressHost)}"\n    resources:\n      requests:\n        cpu: "${yamlString(service.cpu || initial.cpu)}"\n        memory: "${yamlString(service.memory || initial.memory)}"\n      limits:\n        cpu: "${yamlString(service.cpu || initial.cpu)}"\n        memory: "${yamlString(service.memory || initial.memory)}"\n    env:\n${yamlPairsForValues(env, "APP_ENV", "production")}\n    secrets:\n${yamlPairsForValues(secrets, "EXAMPLE_SECRET", "[EXAMPLE_SECRET_PLACEHOLDER]")}`;
     })
     .join("\n");
 
-  return `# Chart.yaml\napiVersion: v2\nname: ${slug(primary.appName)}\ndescription: Generated Helm starter for a ShipConfig service bundle\ntype: application\nversion: 0.1.0\nappVersion: "1.0.0"\n\n# values.yaml\nservices:\n${valuesServices}\n\n# templates/service-bundle.yaml\n# Starter template shape: range over .Values.services to create Deployment, Service, and Ingress per service.\n{{- range $name, $service := .Values.services }}\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {{ $name }}\nspec:\n  replicas: {{ $service.replicas }}\n  selector:\n    matchLabels:\n      app: {{ $name }}\n  template:\n    metadata:\n      labels:\n        app: {{ $name }}\n    spec:\n      containers:\n        - name: {{ $name }}\n          image: {{ $service.image | quote }}\n          ports:\n            - containerPort: {{ $service.port }}\n{{- end }}\n`;
+  return {
+    "helm/Chart.yaml": `apiVersion: v2\nname: ${slug(primary.appName)}\ndescription: Generated Helm starter for a ShipConfig service bundle\ntype: application\nversion: 0.1.0\nappVersion: "1.0.0"\n`,
+    "helm/values.yaml": `services:\n${valuesServices}\n`,
+    "helm/templates/configmap.yaml": `{{- range $name, $service := .Values.services }}\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ $name }}-config\n  labels:\n    app.kubernetes.io/name: {{ $name }}\n    app.kubernetes.io/instance: {{ $.Release.Name }}\ndata:\n{{- range $key, $value := $service.env }}\n  {{ $key }}: {{ $value | quote }}\n{{- end }}\n{{- end }}\n`,
+    "helm/templates/secret.yaml": `{{- range $name, $service := .Values.services }}\n---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: {{ $name }}-secret\n  labels:\n    app.kubernetes.io/name: {{ $name }}\n    app.kubernetes.io/instance: {{ $.Release.Name }}\ntype: Opaque\nstringData:\n{{- range $key, $value := $service.secrets }}\n  {{ $key }}: {{ $value | quote }}\n{{- end }}\n{{- end }}\n`,
+    "helm/templates/deployment.yaml": `{{- range $name, $service := .Values.services }}\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {{ $name }}\n  labels:\n    app.kubernetes.io/name: {{ $name }}\n    app.kubernetes.io/instance: {{ $.Release.Name }}\nspec:\n  replicas: {{ $service.replicas }}\n  selector:\n    matchLabels:\n      app.kubernetes.io/name: {{ $name }}\n      app.kubernetes.io/instance: {{ $.Release.Name }}\n  template:\n    metadata:\n      labels:\n        app.kubernetes.io/name: {{ $name }}\n        app.kubernetes.io/instance: {{ $.Release.Name }}\n    spec:\n      containers:\n        - name: {{ $name }}\n          image: {{ $service.image | quote }}\n          imagePullPolicy: IfNotPresent\n          ports:\n            - name: http\n              containerPort: {{ $service.port }}\n          env:\n{{- range $key, $_ := $service.env }}\n            - name: {{ $key }}\n              valueFrom:\n                configMapKeyRef:\n                  name: {{ $name }}-config\n                  key: {{ $key }}\n{{- end }}\n{{- range $key, $_ := $service.secrets }}\n            - name: {{ $key }}\n              valueFrom:\n                secretKeyRef:\n                  name: {{ $name }}-secret\n                  key: {{ $key }}\n{{- end }}\n          resources:\n{{ toYaml $service.resources | indent 12 }}\n          readinessProbe:\n            httpGet:\n              path: {{ $service.healthPath | quote }}\n              port: http\n            initialDelaySeconds: 10\n            periodSeconds: 10\n          livenessProbe:\n            httpGet:\n              path: {{ $service.healthPath | quote }}\n              port: http\n            initialDelaySeconds: 30\n            periodSeconds: 20\n{{- end }}\n`,
+    "helm/templates/service.yaml": `{{- range $name, $service := .Values.services }}\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: {{ $name }}\n  labels:\n    app.kubernetes.io/name: {{ $name }}\n    app.kubernetes.io/instance: {{ $.Release.Name }}\nspec:\n  selector:\n    app.kubernetes.io/name: {{ $name }}\n    app.kubernetes.io/instance: {{ $.Release.Name }}\n  ports:\n    - name: http\n      port: 80\n      targetPort: http\n{{- end }}\n`,
+    "helm/templates/ingress.yaml": `{{- range $name, $service := .Values.services }}\n{{- if $service.ingress.enabled }}\n---\napiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: {{ $name }}\n  labels:\n    app.kubernetes.io/name: {{ $name }}\n    app.kubernetes.io/instance: {{ $.Release.Name }}\n  annotations:\n    kubernetes.io/ingress.class: nginx\nspec:\n  rules:\n    - host: {{ $service.ingress.host | quote }}\n      http:\n        paths:\n          - path: /\n            pathType: Prefix\n            backend:\n              service:\n                name: {{ $name }}\n                port:\n                  name: http\n{{- end }}\n{{- end }}\n`,
+  };
+}
+
+function helmPreviewFor(files: Record<string, string>) {
+  return [
+    "helm/Chart.yaml",
+    "helm/values.yaml",
+    "helm/templates/configmap.yaml",
+    "helm/templates/secret.yaml",
+    "helm/templates/deployment.yaml",
+    "helm/templates/service.yaml",
+    "helm/templates/ingress.yaml",
+  ]
+    .map((path) => `# ${path}\n${files[path] ?? ""}`.trimEnd())
+    .join("\n\n");
 }
 
 function scoreReadiness(checks: PreflightCheck[], service: ServiceConfig): ScoreResult {
@@ -778,17 +1238,114 @@ function generateFiles(services: ServiceConfig[], primary: ServiceConfig) {
     .join("\n---\n");
   const compose = `services:\n${services.map((service) => composeServiceFor(service, service.id === primary.id)).join("\n\n")}\n`;
   const kubernetes = `${namespaceDocs}\n---\n${services.map(kubernetesServiceFor).join("\n---\n")}\n`;
+  const helmFiles = helmFilesFor(services, primary);
   const actions = `name: Build and Deploy Container Bundle\n\non:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\nenv:\n  PRIMARY_IMAGE: ${fullImageFor(primary)}\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      packages: write\n    steps:\n      - uses: actions/checkout@v4\n      - uses: docker/setup-buildx-action@v3\n      - uses: docker/login-action@v3\n        with:\n          registry: ghcr.io\n          username: \${{ github.actor }}\n          password: \${{ secrets.GITHUB_TOKEN }}\n      - uses: docker/build-push-action@v6\n        with:\n          context: .\n          push: true\n          tags: \${{ env.PRIMARY_IMAGE }}\n      - name: Deploy bundle to Kubernetes\n        run: |\n          kubectl apply -f k8s.yaml\n`;
 
   return {
     "Dockerfile": dockerfileFor(primary.preset, primary.port),
     "docker-compose.yml": compose,
     "k8s.yaml": kubernetes,
-    "helm/Chart-and-values.yaml": helmFor(services, primary),
+    ...helmFiles,
     ".github/workflows/deploy.yml": actions,
     "test-deploy.sh": testDeployScriptFor(services, primary),
     "README.md": readmeFor(services, primary),
   };
+}
+
+function formatLocalDate(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function compactValue(value: string | number) {
+  const text = String(value).replace(/\s+/g, " ").trim();
+  return text.length > 72 ? `${text.slice(0, 69)}...` : text || "(empty)";
+}
+
+function secretKeySummary(value: string) {
+  const keys = parsePairs(value).map((pair) => pair.key);
+  return keys.length ? keys.join(", ") : "(none)";
+}
+
+function diffValueForField(field: keyof FormState, value: string | number) {
+  if (field === "secrets") {
+    return `keys: ${secretKeySummary(String(value))}`;
+  }
+
+  return compactValue(value);
+}
+
+function diffSnapshots(current: PersistedState, saved: PersistedState) {
+  const lines: string[] = [];
+  const fields: { key: keyof FormState; label: string }[] = [
+    { key: "preset", label: "Preset" },
+    { key: "appName", label: "App name" },
+    { key: "image", label: "Image" },
+    { key: "registry", label: "Registry" },
+    { key: "namespace", label: "Namespace" },
+    { key: "port", label: "Port" },
+    { key: "replicas", label: "Replicas" },
+    { key: "ingressHost", label: "Ingress host" },
+    { key: "healthPath", label: "Health path" },
+    { key: "envVars", label: "Env vars" },
+    { key: "secrets", label: "Secret placeholders" },
+    { key: "cpu", label: "CPU" },
+    { key: "memory", label: "Memory" },
+  ];
+
+  if (current.services.length !== saved.services.length) {
+    lines.push(`Services: saved ${saved.services.length} -> current ${current.services.length}`);
+  }
+
+  current.services.forEach((service, index) => {
+    const savedService =
+      saved.services.find((candidate) => candidate.id === service.id) ??
+      saved.services.find((candidate) => slug(candidate.appName) === slug(service.appName)) ??
+      saved.services[index];
+
+    if (!savedService) {
+      lines.push(`+ ${slug(service.appName)} added`);
+      return;
+    }
+
+    fields.forEach(({ key, label }) => {
+      if (service[key] !== savedService[key]) {
+        lines.push(
+          `${slug(service.appName)} / ${label}: ${diffValueForField(key, savedService[key])} -> ${diffValueForField(key, service[key])}`,
+        );
+      }
+    });
+  });
+
+  saved.services.forEach((service, index) => {
+    const stillExists =
+      current.services.some((candidate) => candidate.id === service.id) ||
+      current.services.some((candidate, candidateIndex) => candidateIndex === index && slug(candidate.appName) === slug(service.appName));
+    if (!stillExists) {
+      lines.push(`- ${slug(service.appName)} removed`);
+    }
+  });
+
+  if (current.mode !== saved.mode) {
+    lines.push(`Mode: ${saved.mode} -> ${current.mode}`);
+  }
+  if (current.resolveTarget !== saved.resolveTarget) {
+    lines.push(`Resolve hint: ${saved.resolveTarget} -> ${current.resolveTarget}`);
+  }
+  if (current.theme !== saved.theme) {
+    lines.push(`Theme: ${saved.theme} -> ${current.theme}`);
+  }
+
+  return lines.length ? lines : ["No config differences from the selected saved version."];
 }
 
 export default function Home() {
@@ -808,8 +1365,16 @@ export default function Home() {
   const [resolveError, setResolveError] = useState("");
   const [suggestion, setSuggestion] = useState<ResolveSuggestion | null>(null);
   const [detectedTarget, setDetectedTarget] = useState<ResolveTarget | null>(null);
+  const [proWorkspace, setProWorkspace] = useState<ProWorkspaceState>(() => emptyProWorkspaceState());
+  const hasEditedProWorkspaceRef = useRef(false);
+  const [hasLoadedProWorkspace, setHasLoadedProWorkspace] = useState(false);
+  const [projectName, setProjectName] = useState("");
+  const [versionLabel, setVersionLabel] = useState("");
+  const [presetName, setPresetName] = useState("");
+  const [proMessage, setProMessage] = useState("");
   const form = services.find((service) => service.id === activeServiceId) ?? services[0] ?? initialService;
   const files = useMemo(() => generateFiles(services, form), [form, services]);
+  const filePreviews = useMemo<Record<string, string>>(() => ({ ...files, "helm/": helmPreviewFor(files) }), [files]);
   const preflightChecks = useMemo(() => buildPreflightChecks(form), [form]);
   const preflightSummary = useMemo(() => summarizeChecks(preflightChecks), [preflightChecks]);
   const readinessScore = useMemo(() => scoreReadiness(preflightChecks, form), [form, preflightChecks]);
@@ -822,15 +1387,16 @@ export default function Home() {
     [preflightChecks],
   );
   const persistedState = useMemo<PersistedState>(
-    () => ({
-      version: 2,
-      services,
-      activeServiceId,
-      mode,
-      resolveTarget,
-      resolveQuery,
-      theme,
-    }),
+    () =>
+      sanitizePersistedSnapshot({
+        version: 2,
+        services,
+        activeServiceId,
+        mode,
+        resolveTarget,
+        resolveQuery,
+        theme,
+      }),
     [activeServiceId, mode, resolveQuery, resolveTarget, services, theme],
   );
   const selected =
@@ -841,12 +1407,22 @@ export default function Home() {
         : active === "kubernetes"
           ? "k8s.yaml"
           : active === "helm"
-            ? "helm/Chart-and-values.yaml"
+            ? "helm/"
             : active === "actions"
               ? ".github/workflows/deploy.yml"
               : active === "testDeploy"
-                ? "test-deploy.sh"
-                : "README.md";
+              ? "test-deploy.sh"
+              : "README.md";
+  const activeTeam = selectedProTeam(proWorkspace);
+  const teamProjects = proWorkspace.projects.filter((project) => project.teamId === activeTeam.id);
+  const selectedProject = selectedProProject(proWorkspace);
+  const selectedVersion =
+    selectedProject?.versions.find((version) => version.id === proWorkspace.selectedVersionId) ??
+    selectedProject?.versions.find((version) => version.id === selectedProject.activeVersionId) ??
+    null;
+  const teamPresets = proWorkspace.presets.filter((preset) => preset.teamId === activeTeam.id);
+  const selectedDiffLines = selectedVersion ? diffSnapshots(persistedState, selectedVersion.snapshot) : ["Select a saved version to compare with the current workbench."];
+  const selectedContent = filePreviews[selected] ?? "";
 
   function currentHistoryState(): HistoryState {
     return {
@@ -923,6 +1499,11 @@ export default function Home() {
     return persistedState;
   }
 
+  function updateProWorkspaceState(updater: (current: ProWorkspaceState) => ProWorkspaceState) {
+    hasEditedProWorkspaceRef.current = true;
+    setProWorkspace((current) => normalizeProWorkspaceState(updater(current)));
+  }
+
   useEffect(() => {
     const sharedState = parseSharedState();
     const storedState = parsePersistedState(window.localStorage.getItem(STORAGE_KEY));
@@ -958,6 +1539,245 @@ export default function Home() {
       return () => window.clearTimeout(saveTimer);
     }
   }, [hasLoadedClientState, persistedState]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadTimer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const identity = await proWorkspaceAdapters.auth.getCurrentIdentity();
+          if (!identity) {
+            return;
+          }
+
+          const [teams, memberships, storedWorkspace] = await Promise.all([
+            proWorkspaceAdapters.storage.listTeams(identity.id),
+            proWorkspaceAdapters.auth.resolveMemberships(identity),
+            proWorkspaceAdapters.storage.loadState(),
+          ]);
+
+          if (cancelled) {
+            return;
+          }
+
+          const loadedWorkspace = parseProWorkspaceState(storedWorkspace, identity, teamsWithRoles(teams, memberships));
+          setProWorkspace((current) =>
+            hasEditedProWorkspaceRef.current ? mergeLoadedProWorkspaceState(loadedWorkspace, current) : loadedWorkspace,
+          );
+        } catch {
+          if (!cancelled) {
+            setProMessage("Pro Workspace adapters are unavailable in this browser context.");
+          }
+        } finally {
+          if (!cancelled) {
+            setHasLoadedProWorkspace(true);
+          }
+        }
+      })();
+    }, 0);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(loadTimer);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!hasLoadedProWorkspace) {
+      return;
+    }
+
+    let cancelled = false;
+    void proWorkspaceAdapters.storage.saveState(sanitizeProWorkspaceState(proWorkspace)).catch(() => {
+      if (!cancelled) {
+        setProMessage("Pro Workspace storage is unavailable in this browser context.");
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [hasLoadedProWorkspace, proWorkspace]);
+
+  function selectTeam(teamId: string) {
+    const nextProject = proWorkspace.projects.find((project) => project.teamId === teamId) ?? null;
+    updateProWorkspaceState((current) => {
+      const selectedTeamId = current.teams.some((team) => team.id === teamId) ? teamId : current.selectedTeamId;
+      const selectedProject = current.projects.find((project) => project.teamId === selectedTeamId) ?? null;
+      return {
+        ...current,
+        selectedTeamId,
+        selectedProjectId: selectedProject?.id ?? null,
+        selectedVersionId: selectedProject?.activeVersionId ?? null,
+      };
+    });
+    setProjectName(nextProject?.name ?? "");
+    setVersionLabel("");
+    setProMessage("");
+  }
+
+  function selectProject(projectId: string) {
+    const nextProject = teamProjects.find((project) => project.id === projectId);
+    if (!nextProject) {
+      return;
+    }
+
+    updateProWorkspaceState((current) => ({
+      ...current,
+      selectedProjectId: nextProject.id,
+      selectedVersionId: nextProject.activeVersionId,
+    }));
+    setProjectName(nextProject.name);
+    setVersionLabel("");
+    setProMessage("");
+  }
+
+  function selectVersion(versionId: string) {
+    updateProWorkspaceState((current) => ({
+      ...current,
+      selectedVersionId: versionId,
+    }));
+    setProMessage("");
+  }
+
+  function saveProjectVersion() {
+    const now = new Date().toISOString();
+    const name = projectName.trim() || selectedProject?.name || slug(form.appName);
+    const version: SavedProjectVersion = {
+      id: makeId("ver"),
+      label: versionLabel.trim() || `Snapshot ${formatLocalDate(now)}`,
+      createdAt: now,
+      createdByIdentityId: proWorkspace.identity.id,
+      snapshot: clonePersistedState(persistedState),
+    };
+    const existingProject = selectedProject;
+    const nextProject: SavedProject = existingProject
+      ? {
+          ...existingProject,
+          name,
+          updatedAt: now,
+          activeVersionId: version.id,
+          versions: [...existingProject.versions, version],
+        }
+      : {
+          id: makeId("proj"),
+          teamId: activeTeam.id,
+          name,
+          createdAt: now,
+          updatedAt: now,
+          activeVersionId: version.id,
+          versions: [version],
+        };
+
+    updateProWorkspaceState((current) => {
+      const currentTeam = selectedProTeam(current);
+      const currentProject =
+        current.projects.find((project) => project.teamId === currentTeam.id && project.id === current.selectedProjectId) ?? null;
+      const projectToSave: SavedProject = currentProject
+        ? {
+            ...currentProject,
+            name,
+            updatedAt: now,
+            activeVersionId: version.id,
+            versions: [...currentProject.versions, version],
+          }
+        : {
+            ...nextProject,
+            teamId: currentTeam.id,
+          };
+
+      return {
+        ...current,
+        selectedProjectId: projectToSave.id,
+        selectedVersionId: version.id,
+        projects: currentProject
+          ? current.projects.map((project) => (project.id === projectToSave.id ? projectToSave : project))
+          : [...current.projects, projectToSave],
+      };
+    });
+    setProjectName(name);
+    setVersionLabel("");
+    setProMessage(`Saved ${version.label} to ${name}.`);
+  }
+
+  function restoreSelectedVersion() {
+    if (!selectedVersion) {
+      return;
+    }
+
+    const snapshot = clonePersistedState(selectedVersion.snapshot);
+    commitHistory({
+      services: snapshot.services,
+      activeServiceId: snapshot.activeServiceId,
+      mode: snapshot.mode,
+      resolveTarget: snapshot.resolveTarget,
+      resolveQuery: snapshot.resolveQuery,
+      theme: snapshot.theme,
+    });
+    setProMessage(`Restored ${selectedVersion.label}.`);
+  }
+
+  async function copyVersionReviewLink() {
+    if (!selectedVersion) {
+      return;
+    }
+
+    await copy(shareUrlFor(window.location.href, selectedVersion.snapshot), selectedVersion.id);
+    setProMessage("Review link copied.");
+  }
+
+  function saveWorkspacePreset(scope: WorkspacePreset["scope"]) {
+    const now = new Date().toISOString();
+    const name = presetName.trim() || (scope === "service" ? `${slug(form.appName)} service` : `${projectName.trim() || slug(form.appName)} workspace`);
+    const preset: WorkspacePreset = {
+      id: makeId("preset"),
+      teamId: activeTeam.id,
+      name,
+      scope,
+      createdAt: now,
+      updatedAt: now,
+      service: scope === "service" ? sanitizeServiceSecrets(form) : undefined,
+      snapshot: scope === "workspace" ? clonePersistedState(persistedState) : undefined,
+    };
+
+    updateProWorkspaceState((current) => ({
+      ...current,
+      presets: [
+        ...current.presets,
+        {
+          ...preset,
+          teamId: selectedProTeam(current).id,
+        },
+      ],
+    }));
+    setPresetName("");
+    setProMessage(`Saved ${name} preset.`);
+  }
+
+  function applyWorkspacePreset(preset: WorkspacePreset) {
+    if (preset.scope === "service" && preset.service) {
+      const presetService = preset.service;
+      commitHistory({
+        ...currentHistoryState(),
+        services: services.map((service) => (service.id === activeServiceId ? { ...presetService, id: service.id } : service)),
+      });
+      setProMessage(`Applied ${preset.name}.`);
+      return;
+    }
+
+    if (preset.scope === "workspace" && preset.snapshot) {
+      const snapshot = clonePersistedState(preset.snapshot);
+      commitHistory({
+        services: snapshot.services,
+        activeServiceId: snapshot.activeServiceId,
+        mode: snapshot.mode,
+        resolveTarget: snapshot.resolveTarget,
+        resolveQuery: snapshot.resolveQuery,
+        theme: snapshot.theme,
+      });
+      setProMessage(`Applied ${preset.name}.`);
+    }
+  }
 
   function applyPreset(preset: Preset) {
     commitHistory({
@@ -1095,9 +1915,7 @@ export default function Home() {
   }
 
   async function shareConfig() {
-    const url = new URL(window.location.href);
-    url.hash = `${SHARE_PARAM}=${encodeURIComponent(JSON.stringify(currentPersistedState()))}`;
-    await copy(url.toString(), "share");
+    await copy(shareUrlFor(window.location.href, currentPersistedState()), "share");
   }
 
   function fixPreflight(label: string) {
@@ -1291,6 +2109,187 @@ export default function Home() {
                 Delete
               </button>
             </div>
+            <section className="grid gap-3 border-t border-slate-800 p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold text-slate-200">Pro Workspace</div>
+                  <div className="mt-0.5 truncate text-xs text-slate-500">{proWorkspace.identity.displayName}</div>
+                </div>
+                <span className="shrink-0 rounded-md border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-400">
+                  {activeTeam.role}
+                </span>
+              </div>
+
+              <label className="grid gap-1.5 text-xs font-medium text-slate-400">
+                Team
+                <select
+                  value={activeTeam.id}
+                  onChange={(e) => selectTeam(e.target.value)}
+                  className="h-8 rounded-md border border-slate-800 bg-[#070a0f] px-2 text-xs font-normal text-slate-300 outline-none transition focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                >
+                  {proWorkspace.teams.map((team) => (
+                    <option key={team.id} value={team.id}>
+                      {team.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <div className="grid gap-2 rounded-lg border border-slate-800 bg-[#090d13] p-2.5">
+                <label className="grid gap-1.5 text-xs font-medium text-slate-400">
+                  Project name
+                  <input
+                    value={projectName}
+                    onChange={(e) => setProjectName(e.target.value)}
+                    placeholder={selectedProject?.name ?? slug(form.appName)}
+                    className="h-8 rounded-md border border-slate-800 bg-[#070a0f] px-2 text-xs font-normal text-slate-200 outline-none transition placeholder:text-slate-600 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                  />
+                </label>
+                <label className="grid gap-1.5 text-xs font-medium text-slate-400">
+                  Version label
+                  <input
+                    value={versionLabel}
+                    onChange={(e) => setVersionLabel(e.target.value)}
+                    placeholder="Snapshot label"
+                    className="h-8 rounded-md border border-slate-800 bg-[#070a0f] px-2 text-xs font-normal text-slate-200 outline-none transition placeholder:text-slate-600 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={saveProjectVersion}
+                  className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-sky-400/30 bg-sky-400/15 px-2 text-xs font-medium text-sky-100 transition hover:border-sky-300/50 hover:bg-sky-400/20"
+                >
+                  <CheckCircle2 className="size-3.5" />
+                  Save version
+                </button>
+              </div>
+
+              <div className="grid gap-2 rounded-lg border border-slate-800 bg-[#090d13] p-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-xs font-medium uppercase tracking-wide text-slate-500">Saved projects</div>
+                  <span className="font-mono text-[11px] text-slate-600">{teamProjects.length}</span>
+                </div>
+                {teamProjects.length ? (
+                  <select
+                    value={selectedProject?.id ?? ""}
+                    onChange={(e) => selectProject(e.target.value)}
+                    className="h-8 rounded-md border border-slate-800 bg-[#070a0f] px-2 text-xs text-slate-300 outline-none transition focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                  >
+                    {teamProjects.map((project) => (
+                      <option key={project.id} value={project.id}>
+                        {project.name} - {formatLocalDate(project.updatedAt)}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <div className="rounded-md border border-slate-800 bg-[#070a0f] px-2 py-2 text-[11px] text-slate-500">
+                    No saved projects for this team.
+                  </div>
+                )}
+
+                {selectedProject ? (
+                  <div className="grid gap-1.5">
+                    {selectedProject.versions.map((version) => (
+                      <button
+                        key={version.id}
+                        type="button"
+                        onClick={() => selectVersion(version.id)}
+                        className={`rounded-md border px-2 py-1.5 text-left text-xs transition ${
+                          selectedVersion?.id === version.id
+                            ? "border-sky-400/45 bg-sky-400/10 text-sky-100"
+                            : "border-slate-800 bg-[#070a0f] text-slate-400 hover:border-slate-700 hover:text-slate-200"
+                        }`}
+                      >
+                        <div className="truncate font-medium">{version.label}</div>
+                        <div className="mt-0.5 font-mono text-[11px] text-slate-600">{formatLocalDate(version.createdAt)}</div>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+
+                <div className="grid gap-1 rounded-md border border-slate-800 bg-[#070a0f] p-2 font-mono text-[11px] leading-4 text-slate-500">
+                  {selectedDiffLines.slice(0, 6).map((line) => (
+                    <div key={line} className="truncate">
+                      {line}
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={restoreSelectedVersion}
+                    disabled={!selectedVersion}
+                    className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-slate-700 bg-slate-900 px-2 text-xs font-medium text-slate-200 transition hover:border-slate-600 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    <Undo2 className="size-3.5" />
+                    Restore
+                  </button>
+                  <button
+                    type="button"
+                    onClick={copyVersionReviewLink}
+                    disabled={!selectedVersion}
+                    className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-slate-700 bg-slate-900 px-2 text-xs font-medium text-slate-200 transition hover:border-slate-600 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    <Share2 className="size-3.5" />
+                    {selectedVersion && copied === selectedVersion.id ? "Copied" : "Review"}
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid gap-2 rounded-lg border border-slate-800 bg-[#090d13] p-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-xs font-medium uppercase tracking-wide text-slate-500">Preset library</div>
+                  <span className="font-mono text-[11px] text-slate-600">{teamPresets.length}</span>
+                </div>
+                <input
+                  value={presetName}
+                  onChange={(e) => setPresetName(e.target.value)}
+                  placeholder="Preset name"
+                  className="h-8 rounded-md border border-slate-800 bg-[#070a0f] px-2 text-xs text-slate-200 outline-none transition placeholder:text-slate-600 focus:border-sky-400/60 focus:ring-2 focus:ring-sky-400/10"
+                />
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => saveWorkspacePreset("service")}
+                    className="inline-flex h-8 items-center justify-center rounded-md border border-slate-700 bg-slate-900 px-2 text-xs font-medium text-slate-200 transition hover:border-slate-600 hover:bg-slate-800"
+                  >
+                    Save service
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => saveWorkspacePreset("workspace")}
+                    className="inline-flex h-8 items-center justify-center rounded-md border border-slate-700 bg-slate-900 px-2 text-xs font-medium text-slate-200 transition hover:border-slate-600 hover:bg-slate-800"
+                  >
+                    Save bundle
+                  </button>
+                </div>
+                <div className="grid gap-1.5">
+                  {teamPresets.slice(0, 4).map((preset) => (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      onClick={() => applyWorkspacePreset(preset)}
+                      className="flex min-w-0 items-center justify-between gap-2 rounded-md border border-slate-800 bg-[#070a0f] px-2 py-1.5 text-left text-xs text-slate-400 transition hover:border-slate-700 hover:text-slate-200"
+                    >
+                      <span className="truncate">{preset.name}</span>
+                      <span className="shrink-0 font-mono text-[10px] uppercase text-slate-600">{preset.scope}</span>
+                    </button>
+                  ))}
+                  {!teamPresets.length ? (
+                    <div className="rounded-md border border-slate-800 bg-[#070a0f] px-2 py-2 text-[11px] text-slate-500">
+                      No presets saved yet.
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+
+              {proMessage ? (
+                <div className="rounded-md border border-slate-800 bg-[#070a0f] px-2.5 py-2 text-[11px] leading-4 text-slate-400">
+                  {proMessage}
+                </div>
+              ) : null}
+            </section>
           </aside>
           <aside className="rounded-xl border border-slate-800 bg-[#0c1118] shadow-[0_1px_0_rgba(255,255,255,0.03)_inset] lg:max-h-[calc(100vh-96px)] lg:overflow-auto">
             <div className="border-b border-slate-800 px-4 py-3">
@@ -1634,7 +2633,7 @@ export default function Home() {
                 ))}
               </div>
               <button
-                onClick={() => copy(files[selected], selected)}
+                onClick={() => copy(selectedContent, selected)}
                 className="inline-flex h-8 items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-3 text-sm font-medium text-slate-200 transition hover:border-slate-600 hover:bg-slate-800 xl:ml-3"
               >
                 <Copy className="size-4" />
@@ -1646,7 +2645,7 @@ export default function Home() {
                 <GitBranch className="size-4 shrink-0 text-sky-300" />
                 <span className="truncate font-mono">{selected}</span>
               </div>
-              <div className="font-mono text-xs text-slate-600">{files[selected].split("\n").length} lines</div>
+              <div className="font-mono text-xs text-slate-600">{selectedContent.split("\n").length} lines</div>
             </div>
             <div className="grid gap-3 border-b border-slate-800 bg-[#090d13]/55 p-3 xl:grid-cols-[220px_minmax(0,1fr)]">
               <section className="rounded-lg border border-slate-800 bg-[#070a0f] p-3">
@@ -1714,7 +2713,7 @@ export default function Home() {
                 </div>
               </section>
             </div>
-            <pre className="max-h-[calc(100vh-169px)] min-h-[520px] overflow-auto bg-[#070a0f] p-4 font-mono text-sm leading-6 text-slate-200 sm:p-5"><code>{files[selected]}</code></pre>
+            <pre className="max-h-[calc(100vh-169px)] min-h-[520px] overflow-auto bg-[#070a0f] p-4 font-mono text-sm leading-6 text-slate-200 sm:p-5"><code>{selectedContent}</code></pre>
           </section>
         </section>
       </div>

@@ -171,6 +171,24 @@ const knownHealthPaths: Record<string, string> = {
 
 const statefulWorkloads = new Set(["postgres", "postgresql", "redis", "ollama"]);
 const resolveHints = new Set<ResolveHint>(["auto", "docker", "kubernetes", "compose", "helm", "github-actions", "runtime", "app-description"]);
+const knownDockerImageNames = new Set([
+  "caddy",
+  "httpd",
+  "litellm",
+  "mariadb",
+  "mongo",
+  "mysql",
+  "nextcloud",
+  "nginx",
+  "node",
+  "ollama",
+  "postgres",
+  "postgresql",
+  "python",
+  "rabbitmq",
+  "redis",
+  "traefik",
+]);
 
 const kubernetesProfiles: Record<string, Partial<ResolveSuggestion>> = {
   litellm: {
@@ -267,6 +285,34 @@ function splitImage(input: string) {
   return { namespace: "library", name: parts[0] || clean };
 }
 
+function hasDockerLookupHint(query: string) {
+  const normalized = query.toLowerCase().trim();
+  return /\b(docker hub|docker image|container image|image name|image identifier|registry)\b/.test(normalized) || normalized.startsWith("docker ");
+}
+
+function isExplicitDockerImageIdentifier(query: string) {
+  const clean = query.trim().toLowerCase().replace(/^https?:\/\//, "");
+  if (!clean || /\s/.test(clean)) {
+    return false;
+  }
+
+  if (clean.includes("@sha256:")) {
+    return true;
+  }
+
+  const lastSlash = clean.lastIndexOf("/");
+  const lastColon = clean.lastIndexOf(":");
+  const hasTag = lastColon > lastSlash;
+  const withoutTag = hasTag ? clean.slice(0, lastColon) : clean;
+  const parts = withoutTag.split("/").filter(Boolean);
+
+  if (parts.length >= 2) {
+    return true;
+  }
+
+  return hasTag || knownDockerImageNames.has(normalizeKey(withoutTag));
+}
+
 function withLatestTag(image: string) {
   const lastSlash = image.lastIndexOf("/");
   const lastColon = image.lastIndexOf(":");
@@ -316,14 +362,17 @@ function inferResolveTarget(query: string): ResolveTarget {
   if (hasPhrase(["docker compose", "docker-compose", "compose.yaml", "compose.yml"])) {
     return "compose";
   }
+  if (hasDockerLookupHint(query) || isExplicitDockerImageIdentifier(query)) {
+    return "docker";
+  }
   if (hasPhrase(["node", "next", "express", "nestjs", "fastify", "python", "django", "fastapi", "flask", "go api", "golang", "react app", "static site"])) {
     return "runtime";
   }
-  if (words.length > 2) {
+  if (words.length > 1) {
     return "runtime";
   }
 
-  return "docker";
+  return "runtime";
 }
 
 function inferReplicas(name: string) {
@@ -612,8 +661,8 @@ function resolveTargetFromHint(hint: ResolveHint, query: string): ResolveTarget 
   return hint;
 }
 
-function shouldUseLocalRuntimeBase(hint: ResolveHint, resolveTarget: ResolveTarget) {
-  return hint === "app-description" || (hint === "auto" && resolveTarget === "runtime");
+function shouldUseDockerMetadata(hint: ResolveHint, query: string) {
+  return hint === "docker" || hasDockerLookupHint(query) || isExplicitDockerImageIdentifier(query);
 }
 
 export async function POST(request: Request) {
@@ -641,7 +690,7 @@ export async function POST(request: Request) {
   const baseSuggestion =
     curated[key] ??
     curated[slug(key)] ??
-    (shouldUseLocalRuntimeBase(target as ResolveHint, resolveTarget) ? runtimeBaseSuggestion(query) : await resolveFromDockerHub(query));
+    (shouldUseDockerMetadata(target as ResolveHint, query) ? await resolveFromDockerHub(query) : runtimeBaseSuggestion(query));
   const suggestion = applyTargetDefaults(resolveTarget, baseSuggestion, query);
 
   return NextResponse.json({
